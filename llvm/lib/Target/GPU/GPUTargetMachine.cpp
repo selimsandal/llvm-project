@@ -9,10 +9,12 @@
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/PassRegistry.h"
+#include "llvm/Transforms/Scalar.h"
 
 using namespace llvm;
 
-static const char *GPUDataLayout = "e-p:32:32-i32:32-f32:32-n32";
+// p1:32:32 = addrspace(1) pointers are 32-bit (OpenCL global memory)
+static const char *GPUDataLayout = "e-p:32:32-p1:32:32-p3:32:32-i32:32-f32:32-n32";
 
 static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
   return RM.value_or(Reloc::Static);
@@ -55,6 +57,8 @@ public:
 
   void addIRPasses() override {
     addPass(createGPUSPIRVLoweringPass());
+    // Flatten all address spaces to 0 (GPU has flat 32-bit memory)
+    addPass(createInferAddressSpacesPass(/*FlatAddrSpace=*/0));
     TargetPassConfig::addIRPasses();
   }
 

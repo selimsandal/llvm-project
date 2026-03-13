@@ -27,6 +27,16 @@ public:
   TargetLoweringObjectFile *getObjFileLowering() const override {
     return TLOF.get();
   }
+
+  // All address spaces map to flat 32-bit — addrspacecast is always a no-op
+  bool isNoopAddrSpaceCast(unsigned SrcAS, unsigned DestAS) const override {
+    return true;
+  }
+
+  // Assume all pointers are in flat address space 0
+  unsigned getAssumedAddrSpace(const Value *V) const override {
+    return 0;
+  }
 };
 
 } // namespace llvm
