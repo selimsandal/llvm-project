@@ -1,9 +1,12 @@
 //===-- GPUISelDAGToDAG.cpp - GPU DAG->DAG Pattern Isel ---===//
 
 #include "GPU.h"
+#include "GPUISelLowering.h"
 #include "GPUSubtarget.h"
 #include "GPUTargetMachine.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/CodeGen/SelectionDAGNodes.h"
+#include "llvm/IR/IntrinsicsGPU.h"
 
 using namespace llvm;
 
@@ -117,6 +120,104 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     SDValue Chain = N->getOperand(0);
     SDValue Dest = N->getOperand(1);
     CurDAG->SelectNodeTo(N, GPU::GPU_BR, MVT::Other, Dest, Chain);
+    return;
+  }
+
+  case ISD::ATOMIC_LOAD_ADD:
+  case ISD::ATOMIC_LOAD_AND:
+  case ISD::ATOMIC_LOAD_OR:
+  case ISD::ATOMIC_LOAD_XOR:
+  case ISD::ATOMIC_LOAD_MAX:
+  case ISD::ATOMIC_LOAD_MIN:
+  case ISD::ATOMIC_LOAD_UMAX:
+  case ISD::ATOMIC_LOAD_UMIN:
+  case ISD::ATOMIC_SWAP: {
+    SDLoc DL(N);
+    auto *AN = cast<AtomicSDNode>(N);
+    SDValue Addr = AN->getBasePtr();
+    SDValue Val = AN->getVal();
+
+    unsigned AtomicOp;
+    switch (Opcode) {
+    case ISD::ATOMIC_LOAD_ADD:  AtomicOp = 0; break;
+    case ISD::ATOMIC_LOAD_XOR:  AtomicOp = 2; break;
+    case ISD::ATOMIC_LOAD_OR:   AtomicOp = 3; break;
+    case ISD::ATOMIC_LOAD_MAX:  AtomicOp = 4; break;
+    case ISD::ATOMIC_LOAD_MIN:  AtomicOp = 5; break;
+    case ISD::ATOMIC_LOAD_UMAX: AtomicOp = 6; break;
+    case ISD::ATOMIC_LOAD_UMIN: AtomicOp = 7; break;
+    case ISD::ATOMIC_SWAP:      AtomicOp = 8; break;
+    case ISD::ATOMIC_LOAD_AND:  AtomicOp = 13; break;
+    default: llvm_unreachable("Unexpected atomic op");
+    }
+
+    SDValue Ops[] = {
+      Addr, Val,
+      CurDAG->getTargetConstant(0, DL, MVT::i32), // offset = 0
+      CurDAG->getTargetConstant(AtomicOp, DL, MVT::i32),
+      AN->getChain()
+    };
+    SDNode *AtomicNode = CurDAG->getMachineNode(
+        GPU::ATOMIC, DL, MVT::i32, MVT::Other, Ops);
+    ReplaceNode(N, AtomicNode);
+    return;
+  }
+
+  case ISD::ATOMIC_CMP_SWAP: {
+    SDLoc DL(N);
+    auto *AN = cast<AtomicSDNode>(N);
+    SDValue Addr = AN->getBasePtr();
+    SDValue CmpVal = AN->getOperand(2);
+    SDValue SwapVal = AN->getOperand(3);
+
+    SDValue Ops[] = {
+      Addr, CmpVal, SwapVal,
+      CurDAG->getTargetConstant(0, DL, MVT::i32), // offset = 0
+      AN->getChain()
+    };
+    SDNode *CASNode = CurDAG->getMachineNode(
+        GPU::ATOMIC_CAS, DL, MVT::i32, MVT::Other, Ops);
+    ReplaceNode(N, CASNode);
+    return;
+  }
+
+  case ISD::INTRINSIC_WO_CHAIN: {
+    SDLoc DL(N);
+    unsigned IntrID = N->getConstantOperandVal(0);
+    unsigned ReduceOp;
+    switch (IntrID) {
+    default: break; // Fall through to SelectCode
+    case Intrinsic::gpu_reduce_add:  ReduceOp = 0; goto do_reduce;
+    case Intrinsic::gpu_reduce_and:  ReduceOp = 1; goto do_reduce;
+    case Intrinsic::gpu_reduce_or:   ReduceOp = 2; goto do_reduce;
+    case Intrinsic::gpu_reduce_xor:  ReduceOp = 3; goto do_reduce;
+    case Intrinsic::gpu_reduce_smin: ReduceOp = 4; goto do_reduce;
+    case Intrinsic::gpu_reduce_smax: ReduceOp = 5; goto do_reduce;
+    case Intrinsic::gpu_reduce_umin: ReduceOp = 6; goto do_reduce;
+    case Intrinsic::gpu_reduce_umax: ReduceOp = 7; goto do_reduce;
+    case Intrinsic::gpu_reduce_fadd: ReduceOp = 8; goto do_reduce;
+    case Intrinsic::gpu_reduce_fmin: ReduceOp = 9; goto do_reduce;
+    case Intrinsic::gpu_reduce_fmax: ReduceOp = 10; goto do_reduce;
+    do_reduce: {
+      SDValue Src = N->getOperand(1);
+      SDNode *ReduceNode = CurDAG->getMachineNode(
+          GPU::REDUCE, DL, N->getValueType(0),
+          {Src, CurDAG->getTargetConstant(ReduceOp, DL, MVT::i32)});
+      ReplaceNode(N, ReduceNode);
+      return;
+    }
+    }
+    break; // Fall through to SelectCode for non-GPU intrinsics
+  }
+
+  case GPUISD::REDUCE: {
+    SDLoc DL(N);
+    SDValue Src = N->getOperand(0);
+    unsigned ReduceOp = N->getConstantOperandVal(1);
+    SDNode *ReduceNode = CurDAG->getMachineNode(
+        GPU::REDUCE, DL, N->getValueType(0),
+        {Src, CurDAG->getTargetConstant(ReduceOp, DL, MVT::i32)});
+    ReplaceNode(N, ReduceNode);
     return;
   }
 

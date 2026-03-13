@@ -197,6 +197,16 @@ def NEG : GPUInstUnary<0x0D,
   "neg\t$dst, $src0",
   [(set GPR:$dst, (ineg GPR:$src0))]>;
 
+// Cross-lane reduction: dst = reduce(src0, cond)
+// Result broadcast to all active lanes. hasSideEffects because convergent.
+let hasSideEffects = 1, mayLoad = 0, mayStore = 0 in {
+def REDUCE : GPUInst<(outs GPR:$dst),
+  (ins GPR:$src0, i32imm:$reduce_op),
+  "reduce\t$dst, $src0", []> {
+  let opcode = 0x0F;
+}
+}
+
 // SEL uses flag_reg field, not a GPR for condition
 def SEL : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPR:$src1, i32imm:$freg),
   "sel\t$dst, $src0, $src1", []> {
@@ -236,12 +246,21 @@ def ST_SCATTER : GPUInstMem<0x13,
   [(store i32:$src1, (add i32:$src0, imm:$imm32))]>;
 }
 
-let mayLoad = 1, mayStore = 1 in {
+let mayLoad = 1, mayStore = 1, hasSideEffects = 1 in {
 def ATOMIC : GPUInst<(outs GPR:$dst),
   (ins GPR:$src0, GPR:$src1, GPUimm32:$imm32, i32imm:$atomic_op),
   "atomic\t$dst, [$src0 + $imm32], $src1", []> {
   let opcode = 0x14;
   let imm_en = 1;
+}
+
+// CAS needs 3 GPR sources: addr, compare, swap
+def ATOMIC_CAS : GPUInst<(outs GPR:$dst),
+  (ins GPR:$src0, GPR:$src1, GPR:$src2, GPUimm32:$imm32),
+  "atomic_cas\t$dst, [$src0 + $imm32], $src1, $src2", []> {
+  let opcode = 0x14;
+  let imm_en = 1;
+  let cond = 9;
 }
 }
 
