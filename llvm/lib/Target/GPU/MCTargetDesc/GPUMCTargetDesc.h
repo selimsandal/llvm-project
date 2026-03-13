@@ -17,6 +17,11 @@ class Target;
 
 MCCodeEmitter *createGPUMCCodeEmitter(const MCInstrInfo &MCII,
                                       MCContext &Ctx);
+
+MCAsmBackend *createGPUAsmBackend(const Target &T,
+                                  const MCSubtargetInfo &STI,
+                                  const MCRegisterInfo &MRI,
+                                  const MCTargetOptions &Options);
 } // namespace llvm
 
 // Defines symbolic names for GPU registers.

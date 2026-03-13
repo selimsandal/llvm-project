@@ -61,5 +61,6 @@ LLVMInitializeGPUTargetMC() {
   TargetRegistry::RegisterMCRegInfo(T, createGPUMCRegisterInfo);
   TargetRegistry::RegisterMCSubtargetInfo(T, createGPUMCSubtargetInfo);
   TargetRegistry::RegisterMCCodeEmitter(T, createGPUMCCodeEmitter);
+  TargetRegistry::RegisterMCAsmBackend(T, createGPUAsmBackend);
   TargetRegistry::RegisterMCInstPrinter(T, createGPUMCInstPrinter);
 }
