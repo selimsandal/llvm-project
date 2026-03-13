@@ -111,6 +111,34 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     ReplaceNode(N, MoviNode);
     return;
   }
+
+  case ISD::BR: {
+    SDLoc DL(N);
+    SDValue Chain = N->getOperand(0);
+    SDValue Dest = N->getOperand(1);
+    CurDAG->SelectNodeTo(N, GPU::GPU_BR, MVT::Other, Dest, Chain);
+    return;
+  }
+
+  case GPUISD::BRCOND: {
+    SDLoc DL(N);
+    SDValue Chain = N->getOperand(0);
+    unsigned Invert = N->getConstantOperandVal(1);
+    unsigned FReg = N->getConstantOperandVal(2);
+    SDValue Dest = N->getOperand(3);
+    SDValue Glue = N->getOperand(4);
+
+    SDValue Ops[] = {
+      CurDAG->getTargetConstant(Invert, DL, MVT::i32),
+      CurDAG->getTargetConstant(FReg, DL, MVT::i32),
+      Dest,
+      Chain,
+      Glue
+    };
+
+    CurDAG->SelectNodeTo(N, GPU::GPU_BRCOND, MVT::Other, Ops);
+    return;
+  }
   }
 
   SelectCode(N);

@@ -72,8 +72,8 @@ GPUTargetLowering::GPUTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::FREM, MVT::f32, Expand);
 
   // Control flow
-  setOperationAction(ISD::BR_CC, MVT::i32, Expand);
-  setOperationAction(ISD::BR_CC, MVT::f32, Expand);
+  setOperationAction(ISD::BR_CC, MVT::i32, Custom);
+  setOperationAction(ISD::BR_CC, MVT::f32, Custom);
   setOperationAction(ISD::BRCOND, MVT::Other, Expand);
   setOperationAction(ISD::BR_JT, MVT::Other, Expand);
   setOperationAction(ISD::SETCC, MVT::i32, Custom);
@@ -114,6 +114,8 @@ SDValue GPUTargetLowering::LowerOperation(SDValue Op,
     return LowerSELECT_CC(Op, DAG);
   case ISD::SETCC:
     return LowerSETCC(Op, DAG);
+  case ISD::BR_CC:
+    return LowerBR_CC(Op, DAG);
   }
 }
 
@@ -123,6 +125,7 @@ const char *GPUTargetLowering::getTargetNodeName(unsigned Opcode) const {
   case GPUISD::MOVI:    return "GPUISD::MOVI";
   case GPUISD::CMP:     return "GPUISD::CMP";
   case GPUISD::SEL:     return "GPUISD::SEL";
+  case GPUISD::BRCOND:  return "GPUISD::BRCOND";
   case GPUISD::HALT:    return "GPUISD::HALT";
   case GPUISD::RETURN:  return "GPUISD::RETURN";
   case GPUISD::WRAPPER: return "GPUISD::WRAPPER";
@@ -232,6 +235,36 @@ SDValue GPUTargetLowering::LowerSELECT_CC(SDValue Op,
   return DAG.getNode(GPUISD::SEL, DL, Op.getValueType(),
                      TrueVal, FalseVal,
                      DAG.getTargetConstant(0, DL, MVT::i32),
+                     Cmp);
+}
+
+SDValue GPUTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc DL(Op);
+  SDValue Chain = Op.getOperand(0);
+  ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(1))->get();
+  SDValue LHS = Op.getOperand(2);
+  SDValue RHS = Op.getOperand(3);
+  SDValue Dest = Op.getOperand(4);
+
+  bool NeedInvert;
+  unsigned HWCond = mapCondCode(CC, NeedInvert);
+
+  if (needsOperandSwap(CC))
+    std::swap(LHS, RHS);
+
+  // Emit CMP -> flag register (via glue)
+  SDValue Cmp = DAG.getNode(GPUISD::CMP, DL, MVT::Glue,
+                            DAG.getTargetConstant(HWCond, DL, MVT::i32),
+                            LHS, RHS,
+                            DAG.getTargetConstant(0, DL, MVT::i32));
+
+  // Emit conditional branch. invert=1 means the branch target is reached
+  // when the flag is FALSE (inverted condition).
+  return DAG.getNode(GPUISD::BRCOND, DL, MVT::Other,
+                     Chain,
+                     DAG.getTargetConstant(NeedInvert ? 1 : 0, DL, MVT::i32),
+                     DAG.getTargetConstant(0, DL, MVT::i32), // flag_reg = f0
+                     Dest,
                      Cmp);
 }
 

@@ -355,34 +355,18 @@ def CMPri : GPUInst<
 
 let hasSideEffects = 1 in {
 
-let isTerminator = 1 in {
+// Mask-stack operations — NOT terminators/branches from LLVM's perspective.
+// The control flow pass inserts these into the middle of a linearized block.
 def IF_INST : GPUInstCF<0x40,
-  (outs), (ins i32imm:$freg, brtarget:$imm32),
+  (outs), (ins i32imm:$freg, GPUimm32:$imm32),
   "if\tf$freg, $imm32", []> {
   let imm_en = 1;
-  let isBranch = 1;
 }
 
 def ELSE_INST : GPUInstCF<0x41,
-  (outs), (ins brtarget:$imm32),
+  (outs), (ins GPUimm32:$imm32),
   "else\t$imm32", []> {
   let imm_en = 1;
-  let isBranch = 1;
-}
-
-def ENDLOOP_INST : GPUInstCF<0x44,
-  (outs), (ins i32imm:$freg, brtarget:$imm32),
-  "endloop\tf$freg, $imm32", []> {
-  let imm_en = 1;
-  let isBranch = 1;
-}
-
-def BREAK_INST : GPUInstCF<0x45,
-  (outs), (ins i32imm:$freg, brtarget:$imm32),
-  "break\tf$freg, $imm32", []> {
-  let imm_en = 1;
-  let isBranch = 1;
-}
 }
 
 def ENDIF_INST : GPUInstCF<0x42,
@@ -392,6 +376,18 @@ def ENDIF_INST : GPUInstCF<0x42,
 def LOOP_INST : GPUInstCF<0x43,
   (outs), (ins),
   "loop", []>;
+
+def ENDLOOP_INST : GPUInstCF<0x44,
+  (outs), (ins i32imm:$freg, GPUimm32:$imm32),
+  "endloop\tf$freg, $imm32", []> {
+  let imm_en = 1;
+}
+
+def BREAK_INST : GPUInstCF<0x45,
+  (outs), (ins i32imm:$freg, GPUimm32:$imm32),
+  "break\tf$freg, $imm32", []> {
+  let imm_en = 1;
+}
 
 let isTerminator = 1, isReturn = 1, isBarrier = 1 in {
 def HALT : GPUInst<(outs), (ins), "halt",
@@ -424,6 +420,25 @@ def SELECT_F32 : GPUPseudo<
 
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
+// Conditional branch pseudo (lowered to IF/ELSE/ENDIF by GPUControlFlow pass)
+// Uses F0 to keep the CMP that writes F0 alive through dead code elimination.
+let isBranch = 1, isTerminator = 1, hasSideEffects = 0,
+    mayLoad = 0, mayStore = 0 in {
+def GPU_BRCOND : GPUPseudo<
+  (outs), (ins i32imm:$invert, i32imm:$freg, brtarget:$target),
+  "gpu_brcond\t$invert, f$freg, $target", []> {
+  let Uses = [F0];
+}
+}
+
+// Unconditional branch pseudo (removed by GPUControlFlow pass)
+let isBranch = 1, isTerminator = 1, isBarrier = 1, hasSideEffects = 0,
+    mayLoad = 0, mayStore = 0 in {
+def GPU_BR : GPUPseudo<
+  (outs), (ins brtarget:$target),
+  "gpu_br\t$target", []>;
+}
+
 //===--------------------------------------------------------------===//
 // Patterns
 //===--------------------------------------------------------------===//
@@ -441,6 +456,14 @@ def : Pat<(i32 (bitconvert f32:$src)), (COPY_TO_REGCLASS GPR:$src, GPR)>;
 def : Pat<(i32 (load i32:$addr)), (LD_SCATTER GPR:$addr, 0)>;
 def : Pat<(f32 (load i32:$addr)), (LD_SCATTER GPR:$addr, 0)>;
 
+// f32 load with offset
+def : Pat<(f32 (load (add i32:$base, imm:$off))),
+          (LD_SCATTER GPR:$base, imm:$off)>;
+
 // Simple store to address (i32 and f32)
 def : Pat<(store i32:$val, i32:$addr), (ST_SCATTER GPR:$addr, GPR:$val, 0)>;
 def : Pat<(store f32:$val, i32:$addr), (ST_SCATTER GPR:$addr, GPR:$val, 0)>;
+
+// f32 store with offset
+def : Pat<(store f32:$val, (add i32:$base, imm:$off)),
+          (ST_SCATTER GPR:$base, GPR:$val, imm:$off)>;

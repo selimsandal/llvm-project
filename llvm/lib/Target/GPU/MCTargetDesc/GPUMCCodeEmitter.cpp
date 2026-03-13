@@ -121,12 +121,20 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
   case GPU::SHL:  opcode = 0x0A; goto alu_rrr;
   case GPU::SHR:  opcode = 0x0B; goto alu_rrr;
   case GPU::SHRA: opcode = 0x0C; goto alu_rrr;
-  case GPU::FADD: opcode = 0x20; goto alu_rrr;
-  case GPU::FMUL: opcode = 0x21; goto alu_rrr;
-  case GPU::FSUB: opcode = 0x22; goto alu_rrr;
-  case GPU::FDIV: opcode = 0x23; goto alu_rrr;
-  case GPU::FMIN: opcode = 0x24; goto alu_rrr;
-  case GPU::FMAX: opcode = 0x25; goto alu_rrr;
+  case GPU::FADD: opcode = 0x20; goto float_rrr;
+  case GPU::FMUL: opcode = 0x21; goto float_rrr;
+  case GPU::FSUB: opcode = 0x22; goto float_rrr;
+  case GPU::FDIV: opcode = 0x23; goto float_rrr;
+  case GPU::FMIN: opcode = 0x24; goto float_rrr;
+  case GPU::FMAX: opcode = 0x25; goto float_rrr;
+  float_rrr:
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    src1 = getRegEncoding(MI.getOperand(2).getReg());
+    // Source modifiers packed in MCInst flags by GPUMCInstLower
+    src0_mod = MI.getFlags() & 0x3;
+    src1_mod = (MI.getFlags() >> 2) & 0x3;
+    break;
   alu_rrr:
     dst = getRegEncoding(MI.getOperand(0).getReg());
     src0 = getRegEncoding(MI.getOperand(1).getReg());
