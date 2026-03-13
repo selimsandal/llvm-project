@@ -56,6 +56,8 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
     return "dxil";
   case hexagon:
     return "hexagon";
+  case gpu:
+    return "gpu";
   case hsail64:
     return "hsail64";
   case hsail:
@@ -273,7 +275,8 @@ StringRef Triple::getArchTypePrefix(ArchType Kind) {
 
   case hexagon:
     return "hexagon";
-
+  case gpu:
+    return "gpu";
   case amdgcn:
     return "amdgcn";
   case r600:
@@ -838,6 +841,7 @@ Triple::ArchType Triple::parseArch(StringRef ArchName) {
           .Case("riscv32be", Triple::riscv32be)
           .Case("riscv64be", Triple::riscv64be)
           .Case("hexagon", Triple::hexagon)
+          .Case("gpu", Triple::gpu)
           .Cases({"s390x", "systemz"}, Triple::systemz)
           .Case("sparc", Triple::sparc)
           .Case("sparcel", Triple::sparcel)
@@ -1203,6 +1207,7 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
   case Triple::bpfeb:
   case Triple::bpfel:
   case Triple::csky:
+  case Triple::gpu:
   case Triple::hexagon:
   case Triple::hsail64:
   case Triple::hsail:
@@ -1948,6 +1953,7 @@ unsigned Triple::getArchPointerBitWidth(llvm::Triple::ArchType Arch) {
   case llvm::Triple::armeb:
   case llvm::Triple::csky:
   case llvm::Triple::dxil:
+  case llvm::Triple::gpu:
   case llvm::Triple::hexagon:
   case llvm::Triple::hsail:
   case llvm::Triple::kalimba:
@@ -2059,6 +2065,7 @@ Triple Triple::get32BitArchVariant() const {
   case Triple::armeb:
   case Triple::csky:
   case Triple::dxil:
+  case Triple::gpu:
   case Triple::hexagon:
   case Triple::hsail:
   case Triple::kalimba:
@@ -2160,6 +2167,7 @@ Triple Triple::get64BitArchVariant() const {
   case Triple::avr:
   case Triple::csky:
   case Triple::dxil:
+  case Triple::gpu:
   case Triple::hexagon:
   case Triple::kalimba:
   case Triple::lanai:
