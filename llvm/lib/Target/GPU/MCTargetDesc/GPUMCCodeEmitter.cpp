@@ -180,6 +180,14 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     src2 = getRegEncoding(MI.getOperand(3).getReg());
     break;
 
+  // REDUCE dst, src0, reduce_op
+  case GPU::REDUCE:
+    opcode = 0x0F;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    cond = MI.getOperand(2).getImm();
+    break;
+
   // SEL dst, src0, src1, freg
   case GPU::SEL:
     opcode = 0x0E;
@@ -232,6 +240,18 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     src1 = getRegEncoding(MI.getOperand(2).getReg());
     imm32 = MI.getOperand(3).getImm();
     cond = MI.getOperand(4).getImm();
+    break;
+
+  // Memory: ATOMIC_CAS dst, src0(addr), src1(cmp), src2(swap), imm32(offset)
+  case GPU::ATOMIC_CAS:
+    opcode = 0x14;
+    imm_en = 1;
+    cond = 9;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    src1 = getRegEncoding(MI.getOperand(2).getReg());
+    src2 = getRegEncoding(MI.getOperand(3).getReg());
+    imm32 = MI.getOperand(4).getImm();
     break;
 
   // Memory: PIXEL_OUT src0, src1, src2

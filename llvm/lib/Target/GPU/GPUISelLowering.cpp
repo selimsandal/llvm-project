@@ -3,6 +3,8 @@
 #include "GPUISelLowering.h"
 #include "GPUSubtarget.h"
 #include "MCTargetDesc/GPUMCTargetDesc.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicsGPU.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -98,7 +100,26 @@ GPUTargetLowering::GPUTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::VACOPY, MVT::Other, Expand);
   setOperationAction(ISD::VAEND, MVT::Other, Expand);
 
+  // Atomics — GPU has native 32-bit atomic RMW via ATOP responder
   setMaxAtomicSizeInBitsSupported(32);
+  setOperationAction(ISD::ATOMIC_LOAD_ADD,  MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_AND,  MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_OR,   MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_XOR,  MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_MIN,  MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_MAX,  MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_UMIN, MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_LOAD_UMAX, MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_SWAP,      MVT::i32, Legal);
+  setOperationAction(ISD::ATOMIC_CMP_SWAP,  MVT::i32, Legal);
+  // No hardware SUB/NAND atomics
+  setOperationAction(ISD::ATOMIC_LOAD_SUB,  MVT::i32, Expand);
+  setOperationAction(ISD::ATOMIC_LOAD_NAND, MVT::i32, Expand);
+
+  // REDUCE intrinsics
+  setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i32, Custom);
+  setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::f32, Custom);
+
   setBooleanContents(ZeroOrOneBooleanContent);
   setMinFunctionAlignment(Align(32));
 }
@@ -116,6 +137,8 @@ SDValue GPUTargetLowering::LowerOperation(SDValue Op,
     return LowerSETCC(Op, DAG);
   case ISD::BR_CC:
     return LowerBR_CC(Op, DAG);
+  case ISD::INTRINSIC_WO_CHAIN:
+    return LowerINTRINSIC_WO_CHAIN(Op, DAG);
   }
 }
 
@@ -126,6 +149,7 @@ const char *GPUTargetLowering::getTargetNodeName(unsigned Opcode) const {
   case GPUISD::CMP:     return "GPUISD::CMP";
   case GPUISD::SEL:     return "GPUISD::SEL";
   case GPUISD::BRCOND:  return "GPUISD::BRCOND";
+  case GPUISD::REDUCE:  return "GPUISD::REDUCE";
   case GPUISD::HALT:    return "GPUISD::HALT";
   case GPUISD::RETURN:  return "GPUISD::RETURN";
   case GPUISD::WRAPPER: return "GPUISD::WRAPPER";
@@ -295,6 +319,44 @@ SDValue GPUTargetLowering::LowerReturn(
     const SmallVectorImpl<SDValue> &OutVals, const SDLoc &DL,
     SelectionDAG &DAG) const {
   return DAG.getNode(GPUISD::RETURN, DL, MVT::Other, Chain);
+}
+
+SDValue GPUTargetLowering::LowerINTRINSIC_WO_CHAIN(SDValue Op,
+                                                    SelectionDAG &DAG) const {
+  unsigned IntrID = Op.getConstantOperandVal(0);
+  SDLoc DL(Op);
+
+  unsigned ReduceOp;
+  switch (IntrID) {
+  default:
+    return SDValue(); // Not ours
+  case Intrinsic::gpu_reduce_add:  ReduceOp = 0; break;
+  case Intrinsic::gpu_reduce_and:  ReduceOp = 1; break;
+  case Intrinsic::gpu_reduce_or:   ReduceOp = 2; break;
+  case Intrinsic::gpu_reduce_xor:  ReduceOp = 3; break;
+  case Intrinsic::gpu_reduce_smin: ReduceOp = 4; break;
+  case Intrinsic::gpu_reduce_smax: ReduceOp = 5; break;
+  case Intrinsic::gpu_reduce_umin: ReduceOp = 6; break;
+  case Intrinsic::gpu_reduce_umax: ReduceOp = 7; break;
+  case Intrinsic::gpu_reduce_fadd: ReduceOp = 8; break;
+  case Intrinsic::gpu_reduce_fmin: ReduceOp = 9; break;
+  case Intrinsic::gpu_reduce_fmax: ReduceOp = 10; break;
+  }
+
+  SDValue Src = Op.getOperand(1);
+  return DAG.getNode(GPUISD::REDUCE, DL, Op.getValueType(),
+                     Src, DAG.getTargetConstant(ReduceOp, DL, MVT::i32));
+}
+
+TargetLoweringBase::AtomicExpansionKind
+GPUTargetLowering::shouldExpandAtomicRMWInIR(const AtomicRMWInst *AI) const {
+  return AtomicExpansionKind::None;
+}
+
+TargetLoweringBase::AtomicExpansionKind
+GPUTargetLowering::shouldExpandAtomicCmpXchgInIR(
+    const AtomicCmpXchgInst *AI) const {
+  return AtomicExpansionKind::None;
 }
 
 Register GPUTargetLowering::getRegisterByName(const char *RegName, LLT VT,

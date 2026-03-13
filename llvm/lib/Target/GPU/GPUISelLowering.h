@@ -16,6 +16,7 @@ enum NodeType : unsigned {
   CMP,        // Compare (writes flag register via glue)
   SEL,        // Select based on flag register
   BRCOND,     // Conditional branch (flag-based, with invert)
+  REDUCE,     // Cross-lane reduction
   HALT,       // Terminate kernel
   RETURN,     // Return (lowered to HALT)
   WRAPPER,    // Address wrapper
@@ -46,6 +47,13 @@ public:
   SDValue LowerSELECT_CC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerINTRINSIC_WO_CHAIN(SDValue Op, SelectionDAG &DAG) const;
+
+  TargetLoweringBase::AtomicExpansionKind
+  shouldExpandAtomicRMWInIR(const AtomicRMWInst *AI) const override;
+
+  TargetLoweringBase::AtomicExpansionKind
+  shouldExpandAtomicCmpXchgInIR(const AtomicCmpXchgInst *AI) const override;
 
   Register getRegisterByName(const char *RegName, LLT VT,
                              const MachineFunction &MF) const override;
