@@ -24,6 +24,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeGPUTarget() {
   initializeGPUDAGToDAGISelLegacyPass(PR);
   initializeGPUControlFlowPass(PR);
   initializeGPUPeepholePass(PR);
+  initializeGPUSPIRVLoweringPass(PR);
 }
 
 GPUTargetMachine::GPUTargetMachine(const Target &T, const Triple &TT,
@@ -50,6 +51,11 @@ public:
 
   GPUTargetMachine &getGPUTargetMachine() const {
     return getTM<GPUTargetMachine>();
+  }
+
+  void addIRPasses() override {
+    addPass(createGPUSPIRVLoweringPass());
+    TargetPassConfig::addIRPasses();
   }
 
   bool addInstSelector() override {

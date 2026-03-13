@@ -23,6 +23,7 @@ add_llvm_target(GPUCodeGen
   GPUMCInstLower.cpp
   GPUPeephole.cpp
   GPURegisterInfo.cpp
+  GPUSPIRVLowering.cpp
   GPUSubtarget.cpp
   GPUTargetMachine.cpp
 
