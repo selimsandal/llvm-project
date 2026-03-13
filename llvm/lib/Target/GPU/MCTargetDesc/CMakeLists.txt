@@ -1,4 +1,5 @@
 add_llvm_component_library(LLVMGPUDesc
+  GPUAsmBackend.cpp
   GPUInstPrinter.cpp
   GPUMCAsmInfo.cpp
   GPUMCCodeEmitter.cpp
