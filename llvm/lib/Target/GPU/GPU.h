@@ -21,6 +21,7 @@ namespace llvm {
 
 class GPUTargetMachine;
 class FunctionPass;
+class ModulePass;
 class PassRegistry;
 
 FunctionPass *createGPUISelDag(GPUTargetMachine &TM,
@@ -33,6 +34,9 @@ void initializeGPUControlFlowPass(PassRegistry &);
 
 FunctionPass *createGPUPeepholePass();
 void initializeGPUPeepholePass(PassRegistry &);
+
+ModulePass *createGPUSPIRVLoweringPass();
+void initializeGPUSPIRVLoweringPass(PassRegistry &);
 
 } // namespace llvm
 
