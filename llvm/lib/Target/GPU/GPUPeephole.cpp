@@ -40,6 +40,8 @@ public:
 private:
   bool formFMA(MachineBasicBlock &MBB);
   bool eliminateRedundantMov(MachineBasicBlock &MBB);
+  bool foldImmediates(MachineBasicBlock &MBB);
+  bool foldSourceModifiers(MachineBasicBlock &MBB);
 
   // Find the unique instruction in MBB that defines PhysReg,
   // between Start (exclusive, searching backward) and the beginning.
@@ -179,11 +181,166 @@ bool GPUPeephole::eliminateRedundantMov(MachineBasicBlock &MBB) {
   return Changed;
 }
 
+// Map register-form opcode to its immediate-form counterpart.
+// Returns 0 if no immediate form exists.
+static unsigned getImmediateOpcode(unsigned Opc) {
+  switch (Opc) {
+  case GPU::ADD:  return GPU::ADDi;
+  case GPU::SUB:  return GPU::SUBi;
+  case GPU::MUL:  return GPU::MULi;
+  case GPU::AND:  return GPU::ANDi;
+  case GPU::OR:   return GPU::ORi;
+  case GPU::XOR:  return GPU::XORi;
+  case GPU::SHL:  return GPU::SHLi;
+  case GPU::SHR:  return GPU::SHRi;
+  case GPU::SHRA: return GPU::SHRAi;
+  case GPU::FADD: return GPU::FADDi;
+  case GPU::FMUL: return GPU::FMULi;
+  case GPU::FSUB: return GPU::FSUBi;
+  default:        return 0;
+  }
+}
+
+// MOVI(t, imm) + ALU(d, x, t) -> ALUi(d, x, imm)
+// when t has no other uses between the MOVI and the ALU op.
+bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
+  bool Changed = false;
+  SmallVector<std::pair<MachineInstr *, MachineInstr *>, 4> ToFold;
+
+  for (MachineInstr &MI : MBB) {
+    unsigned ImmOpc = getImmediateOpcode(MI.getOpcode());
+    if (!ImmOpc)
+      continue;
+
+    // Check if src1 (operand 2) was defined by a nearby MOVI
+    if (!MI.getOperand(2).isReg())
+      continue;
+    Register Src1Reg = MI.getOperand(2).getReg();
+
+    MachineInstr *MoviMI = findSingleDef(MBB, MI.getIterator(), Src1Reg);
+    if (!MoviMI || MoviMI->getOpcode() != GPU::MOVI)
+      continue;
+
+    if (MoviMI->getOperand(0).getReg() != Src1Reg)
+      continue;
+
+    if (hasInterveningUse(MBB, MoviMI, &MI, Src1Reg))
+      continue;
+
+    // Found: MOVI(t, imm) + ALU(d, x, t) -> ALUi(d, x, imm)
+    uint32_t ImmVal = MoviMI->getOperand(1).getImm();
+    Register DstReg = MI.getOperand(0).getReg();
+    Register Src0Reg = MI.getOperand(1).getReg();
+
+    const TargetInstrInfo &TII =
+        *MBB.getParent()->getSubtarget().getInstrInfo();
+
+    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(ImmOpc), DstReg)
+        .addReg(Src0Reg)
+        .addImm(ImmVal);
+
+    ToFold.push_back({MoviMI, &MI});
+    Changed = true;
+  }
+
+  for (auto &[MoviMI, AluMI] : ToFold) {
+    AluMI->eraseFromParent();
+    MoviMI->eraseFromParent();
+  }
+
+  return Changed;
+}
+
+// Source modifier folding: FSUB(R31, x) -> FNEG pattern, AND(x, 0x7FFFFFFF) -> FABS pattern.
+// When the result feeds a float ALU op as src1, we can fold by
+// changing the ALU src1 to x and emitting with src1_mod bits.
+// Since we can't add mod operands to existing instructions without
+// new TableGen defs, we annotate the MI's operand TargetFlags.
+// The MCCodeEmitter reads these flags and sets src_mod bits.
+//
+// TargetFlags on a register operand:
+//   0 = no modifier
+//   1 = NEG (flip sign bit)
+//   2 = ABS (clear sign bit)
+//   3 = NEGABS (set sign bit)
+//
+// This folds: FSUB(zero, x) + FADD(d, y, t) -> FADD(d, y, x) with src1_mod=1
+static bool isFloatALU(unsigned Opc) {
+  switch (Opc) {
+  case GPU::FADD: case GPU::FMUL: case GPU::FSUB:
+  case GPU::FDIV: case GPU::FMIN: case GPU::FMAX:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool GPUPeephole::foldSourceModifiers(MachineBasicBlock &MBB) {
+  bool Changed = false;
+  SmallVector<MachineInstr *, 4> ToErase;
+
+  for (MachineInstr &MI : MBB) {
+    if (!isFloatALU(MI.getOpcode()))
+      continue;
+
+    // Check src0 (operand 1) and src1 (operand 2) for modifier patterns
+    for (unsigned SrcIdx = 1; SrcIdx <= 2; ++SrcIdx) {
+      if (!MI.getOperand(SrcIdx).isReg())
+        continue;
+      Register SrcReg = MI.getOperand(SrcIdx).getReg();
+
+      MachineInstr *DefMI = findSingleDef(MBB, MI.getIterator(), SrcReg);
+      if (!DefMI)
+        continue;
+
+      unsigned Mod = 0;
+      Register RealSrc;
+
+      // Pattern: FSUB(R31, x) -> NEG(x)
+      // R31 is the zero register (register 31)
+      if (DefMI->getOpcode() == GPU::FSUB &&
+          DefMI->getOperand(1).isReg() &&
+          DefMI->getOperand(1).getReg() == GPU::R31) {
+        Mod = 1; // NEG
+        RealSrc = DefMI->getOperand(2).getReg();
+      }
+      // Pattern: ANDi(x, 0x7FFFFFFF) -> ABS(x)
+      else if (DefMI->getOpcode() == GPU::ANDi &&
+               DefMI->getOperand(2).getImm() == 0x7FFFFFFF) {
+        Mod = 2; // ABS
+        RealSrc = DefMI->getOperand(1).getReg();
+      }
+
+      if (Mod == 0)
+        continue;
+
+      // Check the def result is only used by this instruction
+      if (DefMI->getOperand(0).getReg() != SrcReg)
+        continue;
+      if (hasInterveningUse(MBB, DefMI, &MI, SrcReg))
+        continue;
+
+      // Fold: replace the source register and set target flags
+      MI.getOperand(SrcIdx).setReg(RealSrc);
+      MI.getOperand(SrcIdx).setTargetFlags(Mod);
+      ToErase.push_back(DefMI);
+      Changed = true;
+    }
+  }
+
+  for (MachineInstr *MI : ToErase)
+    MI->eraseFromParent();
+
+  return Changed;
+}
+
 bool GPUPeephole::runOnMachineFunction(MachineFunction &MF) {
   bool Changed = false;
 
   for (MachineBasicBlock &MBB : MF) {
     Changed |= formFMA(MBB);
+    Changed |= foldImmediates(MBB);
+    Changed |= foldSourceModifiers(MBB);
     Changed |= eliminateRedundantMov(MBB);
   }
 

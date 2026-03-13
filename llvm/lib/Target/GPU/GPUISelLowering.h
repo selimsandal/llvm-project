@@ -15,6 +15,7 @@ enum NodeType : unsigned {
   MOVI,       // Move immediate
   CMP,        // Compare (writes flag register via glue)
   SEL,        // Select based on flag register
+  BRCOND,     // Conditional branch (flag-based, with invert)
   HALT,       // Terminate kernel
   RETURN,     // Return (lowered to HALT)
   WRAPPER,    // Address wrapper
