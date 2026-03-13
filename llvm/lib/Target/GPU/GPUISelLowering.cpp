@@ -26,6 +26,9 @@ GPUTargetLowering::GPUTargetLowering(const TargetMachine &TM,
 
   computeRegisterProperties(STI.getRegisterInfo());
 
+  // Float constants — bitcast to i32 and use MOVI
+  setOperationAction(ISD::ConstantFP, MVT::f32, Custom);
+
   // Promote small integers to i32
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i1, Expand);
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i8, Expand);
@@ -139,6 +142,15 @@ SDValue GPUTargetLowering::LowerOperation(SDValue Op,
     return LowerBR_CC(Op, DAG);
   case ISD::INTRINSIC_WO_CHAIN:
     return LowerINTRINSIC_WO_CHAIN(Op, DAG);
+  case ISD::ConstantFP: {
+    // Bitcast f32 constant to i32, load via MOVI, bitcast back
+    SDLoc DL(Op);
+    const APFloat &Val = cast<ConstantFPSDNode>(Op)->getValueAPF();
+    uint32_t Bits = Val.bitcastToAPInt().getZExtValue();
+    SDValue IntVal = DAG.getNode(GPUISD::MOVI, DL, MVT::i32,
+                                 DAG.getTargetConstant(Bits, DL, MVT::i32));
+    return DAG.getNode(ISD::BITCAST, DL, MVT::f32, IntVal);
+  }
   }
 }
 
