@@ -38,6 +38,9 @@ void initializeGPUPeepholePass(PassRegistry &);
 ModulePass *createGPUSPIRVLoweringPass();
 void initializeGPUSPIRVLoweringPass(PassRegistry &);
 
+ModulePass *createGPUHLSLLoweringPass();
+void initializeGPUHLSLLoweringPass(PassRegistry &);
+
 } // namespace llvm
 
 #endif
