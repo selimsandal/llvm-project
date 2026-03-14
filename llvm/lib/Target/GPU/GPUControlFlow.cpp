@@ -169,12 +169,175 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
   if (!Header || !Latch)
     return;
 
-  unsigned FR = allocFlagReg();
+  // Find the flag register used by the latch's CMP (loop continuation
+  // condition). ENDLOOP must use this same flag register.
+  unsigned LatchFReg = 0;
+  for (auto &MI : *Latch) {
+    if (MI.getOpcode() == GPU::CMPrr)
+      LatchFReg = MI.getOperand(3).getImm();
+    else if (MI.getOpcode() == GPU::CMPri)
+      LatchFReg = MI.getOperand(3).getImm();
+  }
+
+  // Insert LOOP at header start
   BuildMI(*Header, Header->begin(), DebugLoc(), TII->get(GPU::LOOP_INST));
+
+  // Handle early loop exits (BREAK) in non-latch blocks.
+  // The latch exit is handled by ENDLOOP.
+  for (MachineBasicBlock *BB : L->getBlocks()) {
+    if (BB == Latch)
+      continue;
+
+    BranchInfo Info;
+    if (!getBranchInfo(*BB, Info))
+      continue;
+
+    bool TargetInLoop = L->contains(Info.BranchTarget);
+    bool FallthroughInLoop = L->contains(Info.Fallthrough);
+
+    if (TargetInLoop == FallthroughInLoop)
+      continue; // Both inside or both outside — skip
+
+    MachineBasicBlock *ExitBB =
+        TargetInLoop ? Info.Fallthrough : Info.BranchTarget;
+    MachineBasicBlock *InLoopBB =
+        TargetInLoop ? Info.BranchTarget : Info.Fallthrough;
+    bool ExitIsTarget = !TargetInLoop;
+
+    // BREAK does: exec_mask &= ~flag[freg] (deactivates flag=1 lanes).
+    // We need flag=1 for "should break" lanes.
+    // NeedNegate is true when the existing flag has the wrong polarity.
+    bool NeedNegate = (ExitIsTarget == (Info.Invert != 0));
+
+    unsigned BreakFReg;
+    if (!NeedNegate) {
+      BreakFReg = Info.FReg;
+    } else {
+      // Negate by emitting a CMP with swapped operands to a new flag reg.
+      BreakFReg = allocFlagReg();
+      if (BreakFReg == LatchFReg)
+        BreakFReg = allocFlagReg();
+
+      // Find the CMP that wrote to Info.FReg
+      MachineInstr *CmpMI = nullptr;
+      for (auto It = BB->end(); It != BB->begin();) {
+        --It;
+        if ((It->getOpcode() == GPU::CMPrr ||
+             It->getOpcode() == GPU::CMPri) &&
+            It->getOperand(3).getImm() == (int64_t)Info.FReg) {
+          CmpMI = &*It;
+          break;
+        }
+      }
+
+      if (CmpMI && CmpMI->getOpcode() == GPU::CMPrr) {
+        // CMPrr: (src0, src1, cc, freg) — swap src0 and src1
+        auto InsertPt = std::next(MachineBasicBlock::iterator(CmpMI));
+        BuildMI(*BB, InsertPt, DebugLoc(), TII->get(GPU::CMPrr))
+            .addReg(CmpMI->getOperand(1).getReg())
+            .addReg(CmpMI->getOperand(0).getReg())
+            .addImm(CmpMI->getOperand(2).getImm())
+            .addImm(BreakFReg);
+      } else {
+        // CMPri or not found — use original flag (best effort)
+        BreakFReg = Info.FReg;
+      }
+    }
+
+    // Remove branch pseudos and insert BREAK
+    removeBranchPseudos(*BB);
+    BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
+        .addImm(BreakFReg)
+        .addImm(0); // offset computed later in computeOffsets
+
+    // Update CFG: remove exit edge, keep in-loop edge
+    BB->removeSuccessor(ExitBB);
+    if (!BB->isSuccessor(InLoopBB))
+      BB->addSuccessor(InLoopBB);
+  }
+
+  // Handle loop-exit PHI copies: the latch may have an exit successor
+  // (e.g., bb.5) containing MOV instructions for PHI resolution.
+  // These must execute BEFORE ENDLOOP pops the mask stack (otherwise
+  // they'd run for ALL lanes including ones that BREAKed earlier).
+  // Replace each MOV with SEL(dst, dst, src, loop_flag) so it only
+  // affects lanes where the loop counter expired (flag=0).
+  SmallVector<MachineBasicBlock *, 2> LatchSuccs(Latch->succ_begin(),
+                                                  Latch->succ_end());
+  for (auto *ExitBB : LatchSuccs) {
+    if (L->contains(ExitBB))
+      continue; // Skip in-loop successors
+    if (ExitBB->pred_size() != 1)
+      continue; // Only handle single-predecessor exit blocks
+
+    // Collect MOV instructions from the exit block and insert SELs
+    // before the ENDLOOP position (end of latch).
+    for (auto It = ExitBB->begin(); It != ExitBB->end();) {
+      MachineInstr &MI = *It++;
+      if (MI.getOpcode() == GPU::GPU_BR || MI.getOpcode() == GPU::GPU_BRCOND)
+        continue; // Skip branch pseudos
+      if (MI.getOpcode() == GPU::MOV && MI.getOperand(0).isReg() &&
+          MI.getOperand(1).isReg()) {
+        // MOV dst, src → SEL dst, dst, src (flag ? keep : overwrite)
+        // SEL uses default flag_reg=0 which matches the latch CMP.
+        Register DstReg = MI.getOperand(0).getReg();
+        Register SrcReg = MI.getOperand(1).getReg();
+        BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL), DstReg)
+            .addReg(DstReg)
+            .addReg(SrcReg);
+      } else if (MI.getOpcode() == GPU::MOVI) {
+        // MOVI dst, imm → need to load imm into a temp register first,
+        // then SEL. For now, just move the MOVI as-is (it's for the
+        // "loop not entered" path which is handled by IF/ELSE).
+      }
+      // Other instructions: leave in exit block
+    }
+
+    // Clean up the exit block — remove the MOVs we replaced
+    SmallVector<MachineInstr *, 4> ToErase;
+    for (auto &MI : *ExitBB) {
+      if (MI.getOpcode() == GPU::MOV || MI.getOpcode() == GPU::GPU_BR)
+        ToErase.push_back(&MI);
+    }
+    for (auto *MI : ToErase)
+      MI->eraseFromParent();
+  }
+
+  // Remove branch pseudos from latch and insert ENDLOOP
   removeBranchPseudos(*Latch);
   BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::ENDLOOP_INST))
-      .addImm(FR)
+      .addImm(LatchFReg)
       .addImm(0);
+
+  // Update latch CFG: remove back-edge, keep exit edge for linear merging
+  SmallVector<MachineBasicBlock *, 4> LatchSuccsCopy(Latch->succ_begin(),
+                                                      Latch->succ_end());
+  for (auto *S : LatchSuccsCopy) {
+    if (L->contains(S))
+      Latch->removeSuccessor(S);
+  }
+
+  // Merge loop-internal blocks only (not the exit block).
+  // The exit block has PHI copies that must remain outside the loop
+  // so they execute with the correct exec_mask after ENDLOOP.
+  while (Header->succ_size() == 1) {
+    MachineBasicBlock *Next = *Header->succ_begin();
+    if (Next->pred_size() != 1)
+      break;
+    // Don't merge blocks that were outside the loop — their PHI copies
+    // must execute after ENDLOOP restores the mask stack.
+    if (!L->contains(Next))
+      break;
+    Header->splice(Header->end(), Next, Next->begin(), Next->end());
+    Header->removeSuccessor(Next);
+    SmallVector<MachineBasicBlock *, 4> Succs(Next->succ_begin(),
+                                              Next->succ_end());
+    for (auto *S : Succs) {
+      Header->addSuccessor(S);
+      Next->removeSuccessor(S);
+    }
+    Next->eraseFromParent();
+  }
 }
 
 // Reorder blocks so that A comes right after Anchor.
@@ -527,6 +690,7 @@ void GPUControlFlow::computeOffsets(MachineFunction &MF) {
 
   struct LoopEntry {
     MachineInstr *LoopMI;
+    SmallVector<MachineInstr *, 2> Breaks;
   };
   SmallVector<LoopEntry, 4> LoopStack;
 
@@ -559,12 +723,22 @@ void GPUControlFlow::computeOffsets(MachineFunction &MF) {
         break;
       }
       case GPU::LOOP_INST:
-        LoopStack.push_back({&MI});
+        LoopStack.push_back({&MI, {}});
+        break;
+      case GPU::BREAK_INST:
+        assert(!LoopStack.empty() && "BREAK without LOOP");
+        LoopStack.back().Breaks.push_back(&MI);
         break;
       case GPU::ENDLOOP_INST: {
         assert(!LoopStack.empty() && "ENDLOOP without LOOP");
         auto Entry = LoopStack.pop_back_val();
-        MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI]);
+        // ENDLOOP jumps to instruction AFTER LOOP (+1 to skip LOOP itself,
+        // which pushes the mask stack and must only execute once at entry).
+        MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI] + 1);
+        // BREAK skips forward to ENDLOOP (which pops the mask stack).
+        int EndloopSlot = SlotMap[&MI];
+        for (auto *BreakMI : Entry.Breaks)
+          BreakMI->getOperand(1).setImm(EndloopSlot - SlotMap[BreakMI]);
         break;
       }
       default:
@@ -585,10 +759,24 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
   for (MachineLoop *L : MLI)
     processLoop(L);
 
-  // Phase 2: Un-tail-merge HALTs to reconstruct structured CFG
+  // Phase 2: Merge preheader into loop header so conditional pattern
+  // matching sees the loop as a single block. Only merge blocks that
+  // are both single-successor and single-predecessor, and stop at
+  // blocks that follow a loop (they may have exit PHI copies).
+  for (auto &MBB : MF) {
+    // Only merge into blocks that don't end with ENDLOOP
+    bool HasEndloop = false;
+    for (auto &MI : MBB)
+      if (MI.getOpcode() == GPU::ENDLOOP_INST)
+        HasEndloop = true;
+    if (!HasEndloop)
+      mergeLinearChain(MBB);
+  }
+
+  // Phase 3: Un-tail-merge HALTs to reconstruct structured CFG
   Changed |= unTailMergeHALTs(MF);
 
-  // Phase 3: Convert conditionals to IF/ELSE/ENDIF
+  // Phase 4: Convert conditionals to IF/ELSE/ENDIF
   Changed |= processAllConditionals(MF);
 
   // Phase 4: Remove remaining unconditional branch pseudos
@@ -616,8 +804,8 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
   // Phase 6: Ensure HALT at end
   Changed |= ensureHalt(MF);
 
-  // Phase 7: Compute IF/ELSE/ENDLOOP offsets
-  computeOffsets(MF);
+  // Note: offset computation moved to GPUPeephole (runs last, after
+  // instruction-count-changing optimizations like FMA formation).
 
   return Changed;
 }
