@@ -121,6 +121,10 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
   case GPU::SHL:  opcode = 0x0A; goto alu_rrr;
   case GPU::SHR:  opcode = 0x0B; goto alu_rrr;
   case GPU::SHRA: opcode = 0x0C; goto alu_rrr;
+  case GPU::SMINrr: opcode = 0x16; goto alu_rrr;
+  case GPU::SMAXrr: opcode = 0x17; goto alu_rrr;
+  case GPU::UMINrr: opcode = 0x18; goto alu_rrr;
+  case GPU::UMAXrr: opcode = 0x19; goto alu_rrr;
   case GPU::FADD: opcode = 0x20; goto float_rrr;
   case GPU::FMUL: opcode = 0x21; goto float_rrr;
   case GPU::FSUB: opcode = 0x22; goto float_rrr;
