@@ -42,6 +42,7 @@ private:
   bool eliminateRedundantMov(MachineBasicBlock &MBB);
   bool foldImmediates(MachineBasicBlock &MBB);
   bool foldSourceModifiers(MachineBasicBlock &MBB);
+  void computeOffsets(MachineFunction &MF);
 
   // Find the unique instruction in MBB that defines PhysReg,
   // between Start (exclusive, searching backward) and the beginning.
@@ -128,6 +129,28 @@ bool GPUPeephole::formFMA(MachineBasicBlock &MBB) {
       // Check that SrcReg isn't used between FMUL and FADD
       if (hasInterveningUse(MBB, MulMI, &MI, SrcReg))
         continue;
+
+      // Check that SrcReg isn't used AFTER the FADD either — deleting
+      // the FMUL would leave those later uses reading a stale value.
+      {
+        bool UsedAfter = false;
+        auto It = std::next(MachineBasicBlock::iterator(&MI));
+        for (; It != MBB.end(); ++It) {
+          // Check uses before defs: an instruction like "r13 = op r14, r13"
+          // both uses and defines r13 — the use reads the OLD value.
+          bool HasUse = false, HasDef = false;
+          for (const MachineOperand &MO : It->operands()) {
+            if (MO.isReg() && MO.getReg() == SrcReg) {
+              if (MO.isUse()) HasUse = true;
+              if (MO.isDef()) HasDef = true;
+            }
+          }
+          if (HasUse) { UsedAfter = true; break; }
+          if (HasDef) break; // Redefined without reading old value
+        }
+        if (UsedAfter)
+          continue;
+      }
 
       // Check that FMUL's dst == SrcReg
       if (MulMI->getOperand(0).getReg() != SrcReg)
@@ -334,6 +357,81 @@ bool GPUPeephole::foldSourceModifiers(MachineBasicBlock &MBB) {
   return Changed;
 }
 
+// Compute IF/ELSE/ENDLOOP/BREAK offsets from final instruction slots.
+// Must run after all instruction-count-changing optimizations (FMA, imm fold).
+void GPUPeephole::computeOffsets(MachineFunction &MF) {
+  DenseMap<MachineInstr *, int> SlotMap;
+  int Slot = 0;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB)
+      if (!MI.isPseudo())
+        SlotMap[&MI] = Slot++;
+
+  struct IfEntry {
+    MachineInstr *IfMI;
+    MachineInstr *ElseMI = nullptr;
+  };
+  SmallVector<IfEntry, 8> IfStack;
+
+  struct LoopEntry {
+    MachineInstr *LoopMI;
+    SmallVector<MachineInstr *, 2> Breaks;
+  };
+  SmallVector<LoopEntry, 4> LoopStack;
+
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : MBB) {
+      if (MI.isPseudo())
+        continue;
+
+      switch (MI.getOpcode()) {
+      case GPU::IF_INST:
+        IfStack.push_back({&MI});
+        break;
+      case GPU::ELSE_INST:
+        assert(!IfStack.empty() && "ELSE without IF");
+        IfStack.back().ElseMI = &MI;
+        break;
+      case GPU::ENDIF_INST: {
+        assert(!IfStack.empty() && "ENDIF without IF");
+        auto Entry = IfStack.pop_back_val();
+        int EndifSlot = SlotMap[&MI];
+        if (Entry.ElseMI) {
+          Entry.IfMI->getOperand(1).setImm(
+              SlotMap[Entry.ElseMI] - SlotMap[Entry.IfMI] - 1);
+          Entry.ElseMI->getOperand(0).setImm(EndifSlot -
+                                              SlotMap[Entry.ElseMI] - 1);
+        } else {
+          Entry.IfMI->getOperand(1).setImm(EndifSlot -
+                                            SlotMap[Entry.IfMI] - 1);
+        }
+        break;
+      }
+      case GPU::LOOP_INST:
+        LoopStack.push_back({&MI, {}});
+        break;
+      case GPU::BREAK_INST:
+        assert(!LoopStack.empty() && "BREAK without LOOP");
+        LoopStack.back().Breaks.push_back(&MI);
+        break;
+      case GPU::ENDLOOP_INST: {
+        assert(!LoopStack.empty() && "ENDLOOP without LOOP");
+        auto Entry = LoopStack.pop_back_val();
+        // Jump to instruction AFTER LOOP (+1 to skip the LOOP push).
+        MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI] + 1);
+        // BREAK skips forward to ENDLOOP (which pops the mask stack).
+        int EndloopSlot = SlotMap[&MI];
+        for (auto *BreakMI : Entry.Breaks)
+          BreakMI->getOperand(1).setImm(EndloopSlot - SlotMap[BreakMI]);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+}
+
 bool GPUPeephole::runOnMachineFunction(MachineFunction &MF) {
   bool Changed = false;
 
@@ -343,6 +441,10 @@ bool GPUPeephole::runOnMachineFunction(MachineFunction &MF) {
     Changed |= foldSourceModifiers(MBB);
     Changed |= eliminateRedundantMov(MBB);
   }
+
+  // Compute control flow offsets after all instruction-count-changing
+  // optimizations, so offsets reflect final instruction positions.
+  computeOffsets(MF);
 
   return Changed;
 }
