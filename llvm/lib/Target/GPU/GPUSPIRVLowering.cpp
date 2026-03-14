@@ -140,18 +140,16 @@ bool GPUSPIRVLowering::lowerMathBuiltins(Module &M) {
   for (Function &F : M) {
     StringRef Name = F.getName();
 
-    // Classify math builtins
-    // _Z3madfff = mad(float, float, float) → fma
-    // _Z3minfff = min(float, float) → minnum
-    // _Z3maxfff = max(float, float) → maxnum
-    // _Z5clampffff = clamp(float, float, float) → min(max(x,lo),hi)
-    enum { NONE, MAD, FMIN, FMAX } Kind = NONE;
+    // Classify math builtins by name prefix.
+    // OpenCL C++ mangles as: _Z3madfff, _Z3minii, _Z3maxff, etc.
+    // The suffix encodes argument types (f=float, i=int, j=uint).
+    enum { NONE, MAD, MIN, MAX } Kind = NONE;
     if (Name.starts_with("_Z3mad") || Name.starts_with("_Z4fmad"))
       Kind = MAD;
     else if (Name.starts_with("_Z3min") || Name.starts_with("_Z4fmin"))
-      Kind = FMIN;
+      Kind = MIN;
     else if (Name.starts_with("_Z3max") || Name.starts_with("_Z4fmax"))
-      Kind = FMAX;
+      Kind = MAX;
 
     if (Kind == NONE)
       continue;
@@ -164,24 +162,43 @@ bool GPUSPIRVLowering::lowerMathBuiltins(Module &M) {
     for (CallInst *CI : ToReplace) {
       IRBuilder<> Builder(CI);
       Value *Result = nullptr;
+      bool IsFloat = CI->getArgOperand(0)->getType()->isFloatTy();
 
       if (Kind == MAD && CI->arg_size() == 3) {
-        // mad(a, b, c) → fma(a, b, c)
         Function *FMA = Intrinsic::getOrInsertDeclaration(
             &M, Intrinsic::fma, {Builder.getFloatTy()});
         Result = Builder.CreateCall(FMA,
             {CI->getArgOperand(0), CI->getArgOperand(1),
              CI->getArgOperand(2)});
-      } else if (Kind == FMIN && CI->arg_size() == 2) {
-        Function *MinNum = Intrinsic::getOrInsertDeclaration(
-            &M, Intrinsic::minnum, {Builder.getFloatTy()});
-        Result = Builder.CreateCall(MinNum,
-            {CI->getArgOperand(0), CI->getArgOperand(1)});
-      } else if (Kind == FMAX && CI->arg_size() == 2) {
-        Function *MaxNum = Intrinsic::getOrInsertDeclaration(
-            &M, Intrinsic::maxnum, {Builder.getFloatTy()});
-        Result = Builder.CreateCall(MaxNum,
-            {CI->getArgOperand(0), CI->getArgOperand(1)});
+      } else if (Kind == MIN && CI->arg_size() == 2) {
+        if (IsFloat) {
+          Function *Fn = Intrinsic::getOrInsertDeclaration(
+              &M, Intrinsic::minnum, {Builder.getFloatTy()});
+          Result = Builder.CreateCall(Fn,
+              {CI->getArgOperand(0), CI->getArgOperand(1)});
+        } else {
+          // _Z3minii → smin, _Z3minjj → umin
+          bool IsUnsigned = Name.contains('j');
+          Function *Fn = Intrinsic::getOrInsertDeclaration(
+              &M, IsUnsigned ? Intrinsic::umin : Intrinsic::smin,
+              {CI->getArgOperand(0)->getType()});
+          Result = Builder.CreateCall(Fn,
+              {CI->getArgOperand(0), CI->getArgOperand(1)});
+        }
+      } else if (Kind == MAX && CI->arg_size() == 2) {
+        if (IsFloat) {
+          Function *Fn = Intrinsic::getOrInsertDeclaration(
+              &M, Intrinsic::maxnum, {Builder.getFloatTy()});
+          Result = Builder.CreateCall(Fn,
+              {CI->getArgOperand(0), CI->getArgOperand(1)});
+        } else {
+          bool IsUnsigned = Name.contains('j');
+          Function *Fn = Intrinsic::getOrInsertDeclaration(
+              &M, IsUnsigned ? Intrinsic::umax : Intrinsic::smax,
+              {CI->getArgOperand(0)->getType()});
+          Result = Builder.CreateCall(Fn,
+              {CI->getArgOperand(0), CI->getArgOperand(1)});
+        }
       }
 
       if (Result) {

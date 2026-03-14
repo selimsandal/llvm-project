@@ -63,6 +63,12 @@ GPUTargetLowering::GPUTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SRL_PARTS, MVT::i32, Expand);
   setOperationAction(ISD::SRA_PARTS, MVT::i32, Expand);
 
+  // Integer min/max — native single-cycle ALU instructions
+  setOperationAction(ISD::SMAX, MVT::i32, Legal);
+  setOperationAction(ISD::SMIN, MVT::i32, Legal);
+  setOperationAction(ISD::UMAX, MVT::i32, Legal);
+  setOperationAction(ISD::UMIN, MVT::i32, Legal);
+
   // Float
   setOperationAction(ISD::FMA, MVT::f32, Legal);
   setOperationAction(ISD::FMINNUM, MVT::f32, Legal);

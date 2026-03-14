@@ -214,7 +214,26 @@ def SEL : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPR:$src1, i32imm:$freg),
   let hasSideEffects = 0;
   let mayLoad = 0;
   let mayStore = 0;
+  let Uses = [F0]; // Reads flag register written by preceding CMP
 }
+
+// Integer min/max — native single-cycle ALU instructions
+def SMINrr : GPUInstALU<0x16,
+  (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
+  "smin\t$dst, $src0, $src1",
+  [(set GPR:$dst, (smin GPR:$src0, GPR:$src1))]>;
+def SMAXrr : GPUInstALU<0x17,
+  (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
+  "smax\t$dst, $src0, $src1",
+  [(set GPR:$dst, (smax GPR:$src0, GPR:$src1))]>;
+def UMINrr : GPUInstALU<0x18,
+  (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
+  "umin\t$dst, $src0, $src1",
+  [(set GPR:$dst, (umin GPR:$src0, GPR:$src1))]>;
+def UMAXrr : GPUInstALU<0x19,
+  (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
+  "umax\t$dst, $src0, $src1",
+  [(set GPR:$dst, (umax GPR:$src0, GPR:$src1))]>;
 
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
