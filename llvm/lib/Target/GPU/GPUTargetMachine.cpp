@@ -27,6 +27,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeGPUTarget() {
   initializeGPUControlFlowPass(PR);
   initializeGPUPeepholePass(PR);
   initializeGPUSPIRVLoweringPass(PR);
+  initializeGPUHLSLLoweringPass(PR);
 }
 
 GPUTargetMachine::GPUTargetMachine(const Target &T, const Triple &TT,
@@ -57,6 +58,7 @@ public:
 
   void addIRPasses() override {
     addPass(createGPUSPIRVLoweringPass());
+    addPass(createGPUHLSLLoweringPass());
     // Flatten all address spaces to 0 (GPU has flat 32-bit memory)
     addPass(createInferAddressSpacesPass(/*FlatAddrSpace=*/0));
     TargetPassConfig::addIRPasses();

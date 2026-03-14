@@ -17,6 +17,7 @@ add_llvm_target(GPUCodeGen
   GPUAsmPrinter.cpp
   GPUControlFlow.cpp
   GPUFrameLowering.cpp
+  GPUHLSLLowering.cpp
   GPUInstrInfo.cpp
   GPUISelDAGToDAG.cpp
   GPUISelLowering.cpp
