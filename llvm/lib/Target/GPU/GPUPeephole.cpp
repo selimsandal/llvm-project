@@ -250,6 +250,29 @@ bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
     if (hasInterveningUse(MBB, MoviMI, &MI, Src1Reg))
       continue;
 
+    // Don't fold if the register has another definition earlier in the
+    // block. After mask-stack control flow (BREAK, IF/ELSE), a register
+    // may hold per-lane divergent values. The MOVI we found is the
+    // nearest def, but an earlier def (e.g., inside a loop body before
+    // ENDLOOP) means different lanes hold different values.
+    {
+      bool HasEarlierDef = false;
+      auto It = MachineBasicBlock::iterator(MoviMI);
+      while (It != MBB.begin()) {
+        --It;
+        for (const MachineOperand &MO : It->operands()) {
+          if (MO.isReg() && MO.isDef() && MO.getReg() == Src1Reg) {
+            HasEarlierDef = true;
+            break;
+          }
+        }
+        if (HasEarlierDef)
+          break;
+      }
+      if (HasEarlierDef)
+        continue;
+    }
+
     // Check if Src1Reg is used AFTER the ALU op — if so, keep the MOVI
     bool UsedAfter = false;
     {

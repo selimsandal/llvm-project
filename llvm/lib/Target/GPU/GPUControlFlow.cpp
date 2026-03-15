@@ -102,6 +102,8 @@ private:
 
   bool mergeAllBlocks(MachineFunction &MF);
   bool ensureHalt(MachineFunction &MF);
+  void lowerLoopExitMovis(MachineFunction &MF);
+  void fixBreaksInsideIf(MachineFunction &MF);
   void computeOffsets(MachineFunction &MF);
 };
 
@@ -244,59 +246,86 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
       }
     }
 
-    // Remove branch pseudos and insert BREAK
+    // Remove branch pseudos
     removeBranchPseudos(*BB);
+
+    // Clone exit-block computations into BB before BREAK.
+    // These values will be "frozen" for lanes that BREAK deactivates.
+    {
+      MachineFunction &MF = *BB->getParent();
+      for (auto &MI : *ExitBB) {
+        if (MI.isTerminator() || MI.getOpcode() == GPU::GPU_BR ||
+            MI.getOpcode() == GPU::GPU_BRCOND)
+          continue;
+        MachineInstr *Clone = MF.CloneMachineInstr(&MI);
+        BB->insert(BB->end(), Clone);
+      }
+    }
+
+    // Insert BREAK after cloned exit instructions
     BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
         .addImm(BreakFReg)
-        .addImm(0); // offset computed later in computeOffsets
+        .addImm(0); // offset computed later
 
     // Update CFG: remove exit edge, keep in-loop edge
     BB->removeSuccessor(ExitBB);
     if (!BB->isSuccessor(InLoopBB))
       BB->addSuccessor(InLoopBB);
+
+    // Clear exit block if it has no remaining predecessors
+    // (we already cloned its instructions into BB)
+    if (ExitBB->pred_empty()) {
+      SmallVector<MachineInstr *, 8> ToDel;
+      for (auto &MI : *ExitBB)
+        ToDel.push_back(&MI);
+      for (auto *MI : ToDel)
+        MI->eraseFromParent();
+    }
   }
 
-  // Handle loop-exit PHI copies: the latch may have an exit successor
-  // (e.g., bb.5) containing MOV instructions for PHI resolution.
-  // These must execute BEFORE ENDLOOP pops the mask stack (otherwise
-  // they'd run for ALL lanes including ones that BREAKed earlier).
-  // Replace each MOV with SEL(dst, dst, src, loop_flag) so it only
-  // affects lanes where the loop counter expired (flag=0).
+  // Handle loop-exit PHI copies from latch exit block.
+  // MOV copies → SEL with latch flag (only modify exiting lanes).
+  // MOVI copies → LOOP_EXIT_MOVI pseudo (positioned before ENDLOOP
+  // by lowerLoopExitMovis after mergeAllBlocks).
   SmallVector<MachineBasicBlock *, 2> LatchSuccs(Latch->succ_begin(),
                                                   Latch->succ_end());
   for (auto *ExitBB : LatchSuccs) {
     if (L->contains(ExitBB))
-      continue; // Skip in-loop successors
+      continue;
     if (ExitBB->pred_size() != 1)
-      continue; // Only handle single-predecessor exit blocks
+      continue;
 
-    // Collect MOV instructions from the exit block and insert SELs
-    // before the ENDLOOP position (end of latch).
     for (auto It = ExitBB->begin(); It != ExitBB->end();) {
       MachineInstr &MI = *It++;
       if (MI.getOpcode() == GPU::GPU_BR || MI.getOpcode() == GPU::GPU_BRCOND)
-        continue; // Skip branch pseudos
+        continue;
       if (MI.getOpcode() == GPU::MOV && MI.getOperand(0).isReg() &&
           MI.getOperand(1).isReg()) {
-        // MOV dst, src → SEL dst, dst, src (flag ? keep : overwrite)
-        // SEL uses default flag_reg=0 which matches the latch CMP.
+        // MOV dst, src → SEL dst, dst, src, LatchFReg
+        // flag=1 (continue): keep dst. flag=0 (exit): dst = src.
         Register DstReg = MI.getOperand(0).getReg();
         Register SrcReg = MI.getOperand(1).getReg();
         BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL), DstReg)
             .addReg(DstReg)
-            .addReg(SrcReg);
+            .addReg(SrcReg)
+            .addImm(LatchFReg);
       } else if (MI.getOpcode() == GPU::MOVI) {
-        // MOVI dst, imm → need to load imm into a temp register first,
-        // then SEL. For now, just move the MOVI as-is (it's for the
-        // "loop not entered" path which is handled by IF/ELSE).
+        // Emit LOOP_EXIT_MOVI pseudo in the exit block.
+        // After mergeAllBlocks, this ends up after ENDLOOP.
+        // lowerLoopExitMovis will move it right before ENDLOOP.
+        Register DstReg = MI.getOperand(0).getReg();
+        int64_t ImmVal = MI.getOperand(1).getImm();
+        BuildMI(*ExitBB, MI.getIterator(), DebugLoc(),
+                TII->get(GPU::LOOP_EXIT_MOVI), DstReg)
+            .addImm(ImmVal);
       }
-      // Other instructions: leave in exit block
     }
 
-    // Clean up the exit block — remove the MOVs we replaced
+    // Clean up: erase MOV/MOVI/BR (LOOP_EXIT_MOVI survives)
     SmallVector<MachineInstr *, 4> ToErase;
     for (auto &MI : *ExitBB) {
-      if (MI.getOpcode() == GPU::MOV || MI.getOpcode() == GPU::GPU_BR)
+      if (MI.getOpcode() == GPU::MOV || MI.getOpcode() == GPU::MOVI ||
+          MI.getOpcode() == GPU::GPU_BR)
         ToErase.push_back(&MI);
     }
     for (auto *MI : ToErase)
@@ -674,6 +703,50 @@ bool GPUControlFlow::ensureHalt(MachineFunction &MF) {
   return true;
 }
 
+void GPUControlFlow::lowerLoopExitMovis(MachineFunction &MF) {
+  if (MF.size() == 0)
+    return;
+  MachineBasicBlock &MBB = MF.front();
+
+  for (auto It = MBB.begin(); It != MBB.end(); ++It) {
+    if (It->getOpcode() != GPU::ENDLOOP_INST)
+      continue;
+
+    // Scan forward from ENDLOOP, collecting LOOP_EXIT_MOVI instructions.
+    // Skip past any intervening instructions (from exit blocks that
+    // weren't cleared). Stop at control flow boundaries.
+    SmallVector<MachineInstr *, 4> ToLower;
+    auto ScanIt = std::next(MachineBasicBlock::iterator(It));
+    while (ScanIt != MBB.end()) {
+      unsigned Opc = ScanIt->getOpcode();
+      if (Opc == GPU::LOOP_EXIT_MOVI) {
+        ToLower.push_back(&*ScanIt);
+        ++ScanIt;
+      } else if (Opc == GPU::LOOP_INST || Opc == GPU::ENDLOOP_INST ||
+                 Opc == GPU::HALT) {
+        break; // Don't cross control flow boundaries
+      } else {
+        ++ScanIt;
+      }
+    }
+
+    // Convert each to SELi and place right before ENDLOOP.
+    // SELi: flag=1 (continue) → keep old value; flag=0 (exit) → set imm.
+    // This avoids overwriting continuing lanes' register values, which
+    // MOVI would do (it writes ALL active lanes unconditionally).
+    unsigned FReg = It->getOperand(0).getImm(); // ENDLOOP's flag register
+    for (auto *MI : ToLower) {
+      Register DstReg = MI->getOperand(0).getReg();
+      int64_t ImmVal = MI->getOperand(1).getImm();
+      BuildMI(MBB, It, DebugLoc(), TII->get(GPU::SELi), DstReg)
+          .addReg(DstReg)
+          .addImm(ImmVal)
+          .addImm(FReg);
+      MI->eraseFromParent();
+    }
+  }
+}
+
 void GPUControlFlow::computeOffsets(MachineFunction &MF) {
   DenseMap<MachineInstr *, int> SlotMap;
   int Slot = 0;
@@ -800,6 +873,10 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
 
   // Phase 5: Merge all MBBs into a single flat block
   Changed |= mergeAllBlocks(MF);
+
+  // Phase 5.5: Lower LOOP_EXIT_MOVI pseudos — place them right before
+  // their ENDLOOP so they execute inside the loop with correct mask.
+  lowerLoopExitMovis(MF);
 
   // Phase 6: Ensure HALT at end
   Changed |= ensureHalt(MF);
