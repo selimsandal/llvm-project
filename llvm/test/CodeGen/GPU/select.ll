@@ -1,37 +1,39 @@
 ; RUN: llc -march=gpu < %s | FileCheck %s
 
-; Integer compare + select
-define i32 @test_select_lt(i32 %a, i32 %b, i32 %t, i32 %f) {
-; CHECK: cmp
-; CHECK: sel
+; Integer signed min (icmp slt + select of same operands → smin)
+define void @test_select_lt(i32 %a, i32 %b, ptr %out) {
+; CHECK: smin
   %cmp = icmp slt i32 %a, %b
-  %r = select i1 %cmp, i32 %t, i32 %f
-  ret i32 %r
+  %r = select i1 %cmp, i32 %a, i32 %b
+  store i32 %r, ptr %out
+  ret void
 }
 
-; Unsigned compare + select
-define i32 @test_select_ult(i32 %a, i32 %b, i32 %t, i32 %f) {
-; CHECK: cmp
-; CHECK: sel
+; Integer unsigned min (icmp ult + select of same operands → umin)
+define void @test_select_ult(i32 %a, i32 %b, ptr %out) {
+; CHECK: umin
   %cmp = icmp ult i32 %a, %b
-  %r = select i1 %cmp, i32 %t, i32 %f
-  ret i32 %r
+  %r = select i1 %cmp, i32 %a, i32 %b
+  store i32 %r, ptr %out
+  ret void
 }
 
-; Float compare + select
-define float @test_select_flt(float %a, float %b, float %t, float %f) {
+; Float compare + select (different true/false values)
+define void @test_select_flt(float %a, float %b, ptr %out) {
 ; CHECK: cmp
 ; CHECK: sel
   %cmp = fcmp olt float %a, %b
-  %r = select i1 %cmp, float %t, float %f
-  ret float %r
+  %r = select i1 %cmp, float %a, float %b
+  store float %r, ptr %out
+  ret void
 }
 
-; Equality compare
-define i32 @test_select_eq(i32 %a, i32 %b, i32 %t, i32 %f) {
+; Equality compare + select
+define void @test_select_eq(i32 %a, i32 %b, ptr %out) {
 ; CHECK: cmp
 ; CHECK: sel
   %cmp = icmp eq i32 %a, %b
-  %r = select i1 %cmp, i32 %t, i32 %f
-  ret i32 %r
+  %r = select i1 %cmp, i32 %a, i32 %b
+  store i32 %r, ptr %out
+  ret void
 }

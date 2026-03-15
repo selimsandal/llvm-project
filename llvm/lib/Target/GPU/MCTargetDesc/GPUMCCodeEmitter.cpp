@@ -168,8 +168,10 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
   // Unary dst, src0
   case GPU::NOT:  opcode = 0x09; goto unary;
   case GPU::NEG:  opcode = 0x0D; goto unary;
-  case GPU::ITOF: opcode = 0x26; goto unary;
-  case GPU::FTOI: opcode = 0x27; goto unary;
+  case GPU::ITOF:  opcode = 0x26; goto unary;
+  case GPU::FTOI:  opcode = 0x27; goto unary;
+  case GPU::UITOF: opcode = 0x29; goto unary;
+  case GPU::FTOU:  opcode = 0x2A; goto unary;
   unary:
     dst = getRegEncoding(MI.getOperand(0).getReg());
     src0 = getRegEncoding(MI.getOperand(1).getReg());

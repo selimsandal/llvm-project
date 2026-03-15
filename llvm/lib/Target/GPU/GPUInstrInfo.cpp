@@ -28,7 +28,12 @@ void GPUInstrInfo::storeRegToStackSlot(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
     bool isKill, int FrameIndex, const TargetRegisterClass *RC,
     Register VReg, MachineInstr::MIFlag Flags) const {
-  llvm_unreachable("GPU has no stack for register spilling");
+  DebugLoc DL;
+  if (MI != MBB.end())
+    DL = MI->getDebugLoc();
+  BuildMI(MBB, MI, DL, get(GPU::SPILL_GPR))
+      .addReg(SrcReg, getKillRegState(isKill))
+      .addFrameIndex(FrameIndex);
 }
 
 void GPUInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
@@ -37,7 +42,11 @@ void GPUInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
                                         const TargetRegisterClass *RC,
                                         Register VReg, unsigned SubReg,
                                         MachineInstr::MIFlag Flags) const {
-  llvm_unreachable("GPU has no stack for register spilling");
+  DebugLoc DL;
+  if (MI != MBB.end())
+    DL = MI->getDebugLoc();
+  BuildMI(MBB, MI, DL, get(GPU::RELOAD_GPR), DestReg)
+      .addFrameIndex(FrameIndex);
 }
 
 static bool isGPUBranch(unsigned Opc) {
