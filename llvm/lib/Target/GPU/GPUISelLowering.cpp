@@ -322,13 +322,28 @@ SDValue GPUTargetLowering::LowerFormalArguments(
 
   static const MCPhysReg ArgRegs[] = {GPU::R1, GPU::R2, GPU::R3, GPU::R4};
 
-  for (unsigned i = 0, e = Ins.size(); i < e; ++i) {
-    if (i >= 4)
-      report_fatal_error("GPU kernels support at most 4 arguments (r1-r4)");
-    Register VReg = MRI.createVirtualRegister(&GPU::GPRRegClass);
-    MRI.addLiveIn(ArgRegs[i], VReg);
-    SDValue ArgValue = DAG.getCopyFromReg(Chain, DL, VReg, MVT::i32);
-    InVals.push_back(ArgValue);
+  if (Ins.size() <= 4) {
+    // Direct register path: args in r1-r4 via descriptor (zero overhead)
+    for (unsigned i = 0, e = Ins.size(); i < e; ++i) {
+      Register VReg = MRI.createVirtualRegister(&GPU::GPRRegClass);
+      MRI.addLiveIn(ArgRegs[i], VReg);
+      InVals.push_back(DAG.getCopyFromReg(Chain, DL, VReg, MVT::i32));
+    }
+  } else {
+    // Indirect path: r1 = pointer to args buffer in DDR
+    // Host packs all args contiguously: arg0 at [r1+0], arg1 at [r1+4], etc.
+    Register PtrVReg = MRI.createVirtualRegister(&GPU::GPRRegClass);
+    MRI.addLiveIn(GPU::R1, PtrVReg);
+    SDValue PtrVal = DAG.getCopyFromReg(Chain, DL, PtrVReg, MVT::i32);
+
+    for (unsigned i = 0, e = Ins.size(); i < e; ++i) {
+      SDValue Addr = DAG.getNode(ISD::ADD, DL, MVT::i32, PtrVal,
+                                 DAG.getConstant(i * 4, DL, MVT::i32));
+      SDValue ArgVal = DAG.getLoad(MVT::i32, DL, Chain, Addr,
+                                   MachinePointerInfo());
+      Chain = ArgVal.getValue(1);
+      InVals.push_back(ArgVal);
+    }
   }
 
   return Chain;
