@@ -252,6 +252,10 @@ def LD_SCATTER : GPUInstMem<0x12,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "ld_scatter\t$dst, [$src0 + $imm32]",
   [(set i32:$dst, (load (add i32:$src0, imm:$imm32)))]>;
+
+def LD_SCALAR : GPUInstMem<0x1A,
+  (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
+  "ld_scalar\t$dst, [$src0 + $imm32]", []>;
 }
 
 let mayLoad = 0, mayStore = 1 in {
