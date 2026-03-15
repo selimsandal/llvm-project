@@ -219,6 +219,15 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     imm32 = MI.getOperand(1).getImm();
     break;
 
+  // Memory: LD_SCALAR dst, src0, offset (broadcast to all lanes)
+  case GPU::LD_SCALAR:
+    opcode = 0x1A;
+    imm_en = 1;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    imm32 = MI.getOperand(2).getImm();
+    break;
+
   // Memory: LD_SCATTER dst, src0, offset
   case GPU::LD_SCATTER:
     opcode = 0x12;
