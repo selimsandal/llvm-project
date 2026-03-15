@@ -289,7 +289,7 @@ def PIXEL_OUT : GPUInst<(outs),
   (ins GPR:$src0, GPR:$src1, GPR:$src2),
   "pixel_out\t$src0, $src1, $src2", []> {
   let opcode = 0x15;
-  let dst = 31;  // ZERO_REG
+  let dst = 31;
 }
 }
 
@@ -358,6 +358,16 @@ def FMA : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPR:$src1, GPR:$src2),
   [(set GPR:$dst, (fma GPR:$src0, GPR:$src1, GPR:$src2))]> {
   let opcode = 0x28;
 }
+
+def UITOF : GPUInstUnary<0x29,
+  (outs GPR:$dst), (ins GPR:$src0),
+  "uitof\t$dst, $src0",
+  [(set GPR:$dst, (uint_to_fp GPR:$src0))]>;
+
+def FTOU : GPUInstUnary<0x2A,
+  (outs GPR:$dst), (ins GPR:$src0),
+  "ftou\t$dst, $src0",
+  [(set GPR:$dst, (fp_to_uint GPR:$src0))]>;
 
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
@@ -457,6 +467,20 @@ def SELECT_F32 : GPUPseudo<
   "selectf\t$dst, $cond, $t, $f", []>;
 
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
+
+// Spill/reload pseudos for register spilling via scatter load/store
+let hasSideEffects = 0 in {
+let mayLoad = 0, mayStore = 1 in {
+def SPILL_GPR : GPUPseudo<
+  (outs), (ins GPR:$src, i32imm:$fi),
+  "spill\t$src, $fi", []>;
+}
+let mayLoad = 1, mayStore = 0 in {
+def RELOAD_GPR : GPUPseudo<
+  (outs GPR:$dst), (ins i32imm:$fi),
+  "reload\t$dst, $fi", []>;
+}
+}
 
 // Conditional branch pseudo (lowered to IF/ELSE/ENDIF by GPUControlFlow pass)
 // Uses F0 to keep the CMP that writes F0 alive through dead code elimination.

@@ -88,6 +88,7 @@ GPUTargetLowering::GPUTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::BRCOND, MVT::Other, Expand);
   setOperationAction(ISD::BR_JT, MVT::Other, Expand);
   setOperationAction(ISD::SETCC, MVT::i32, Custom);
+  setOperationAction(ISD::SETCC, MVT::f32, Custom);
   setOperationAction(ISD::SELECT, MVT::i32, Expand);
   setOperationAction(ISD::SELECT, MVT::f32, Expand);
   setOperationAction(ISD::SELECT_CC, MVT::i32, Custom);
@@ -188,6 +189,8 @@ static unsigned mapCondCode(ISD::CondCode CC, bool &NeedInvert) {
   NeedInvert = false;
   switch (CC) {
   default: llvm_unreachable("Unsupported condition code");
+  case ISD::SETUEQ: return 3;  // Use FEQ (fast-math treats unordered as ordered)
+  case ISD::SETUNE: NeedInvert = true; return 3;
   case ISD::SETEQ:  return 0;
   case ISD::SETNE:  NeedInvert = true; return 0;
   case ISD::SETLT:  return 1;

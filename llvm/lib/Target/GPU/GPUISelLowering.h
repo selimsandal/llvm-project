@@ -57,6 +57,15 @@ public:
 
   Register getRegisterByName(const char *RegName, LLT VT,
                              const MachineFunction &MF) const override;
+
+  bool shouldConvertConstantLoadToIntImm(const APInt &Imm,
+                                         Type *Ty) const override {
+    return true;
+  }
+
+  bool reduceSelectOfFPConstantLoads(EVT CmpOpVT) const override {
+    return false;
+  }
 };
 
 } // namespace llvm

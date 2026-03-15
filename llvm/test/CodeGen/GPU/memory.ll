@@ -1,10 +1,11 @@
 ; RUN: llc -march=gpu < %s | FileCheck %s
 
 ; Simple i32 load
-define i32 @test_load_i32(ptr %p) {
+define void @test_load_i32(ptr %p, ptr %out) {
 ; CHECK: ld_scatter
   %v = load i32, ptr %p
-  ret i32 %v
+  store i32 %v, ptr %out
+  ret void
 }
 
 ; Simple i32 store
@@ -15,11 +16,12 @@ define void @test_store_i32(ptr %p, i32 %val) {
 }
 
 ; Load with offset
-define i32 @test_load_offset(ptr %p) {
+define void @test_load_offset(ptr %p, ptr %out) {
 ; CHECK: ld_scatter{{.*}}0xc
   %gep = getelementptr i32, ptr %p, i32 3
   %v = load i32, ptr %gep
-  ret i32 %v
+  store i32 %v, ptr %out
+  ret void
 }
 
 ; Store with offset
@@ -31,10 +33,11 @@ define void @test_store_offset(ptr %p, i32 %val) {
 }
 
 ; f32 load
-define float @test_load_f32(ptr %p) {
+define void @test_load_f32(ptr %p, ptr %out) {
 ; CHECK: ld_scatter
   %v = load float, ptr %p
-  ret float %v
+  store float %v, ptr %out
+  ret void
 }
 
 ; f32 store
@@ -45,11 +48,12 @@ define void @test_store_f32(ptr %p, float %val) {
 }
 
 ; f32 load with offset
-define float @test_load_f32_offset(ptr %p) {
+define void @test_load_f32_offset(ptr %p, ptr %out) {
 ; CHECK: ld_scatter{{.*}}0x8
   %gep = getelementptr float, ptr %p, i32 2
   %v = load float, ptr %gep
-  ret float %v
+  store float %v, ptr %out
+  ret void
 }
 
 ; f32 store with offset

@@ -319,13 +319,18 @@ bool GPUPeephole::foldSourceModifiers(MachineBasicBlock &MBB) {
       unsigned Mod = 0;
       Register RealSrc;
 
-      // Pattern: FSUB(R31, x) -> NEG(x)
-      // R31 is the zero register (register 31)
+      // Pattern: FSUB(MOVI(0), x) -> NEG(x)
       if (DefMI->getOpcode() == GPU::FSUB &&
-          DefMI->getOperand(1).isReg() &&
-          DefMI->getOperand(1).getReg() == GPU::R31) {
-        Mod = 1; // NEG
-        RealSrc = DefMI->getOperand(2).getReg();
+          DefMI->getOperand(1).isReg()) {
+        Register FSUBSrc0 = DefMI->getOperand(1).getReg();
+        MachineInstr *Src0Def = findSingleDef(MBB, DefMI->getIterator(), FSUBSrc0);
+        if (Src0Def && Src0Def->getOpcode() == GPU::MOVI &&
+            Src0Def->getOperand(1).getImm() == 0 &&
+            !hasInterveningUse(MBB, Src0Def, DefMI, FSUBSrc0)) {
+          Mod = 1; // NEG
+          RealSrc = DefMI->getOperand(2).getReg();
+          ToErase.push_back(Src0Def);
+        }
       }
       // Pattern: ANDi(x, 0x7FFFFFFF) -> ABS(x)
       else if (DefMI->getOpcode() == GPU::ANDi &&

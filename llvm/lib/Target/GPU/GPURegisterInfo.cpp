@@ -5,6 +5,8 @@
 #include "GPUSubtarget.h"
 #include "MCTargetDesc/GPUMCTargetDesc.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 
@@ -26,19 +28,44 @@ GPURegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
 BitVector GPURegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   BitVector Reserved(getNumRegs());
   Reserved.set(GPU::R0);  // Thread ID (read-only, auto-initialized)
-  Reserved.set(GPU::R31); // Hardwired zero
+  Reserved.set(GPU::R30); // Stack pointer
   return Reserved;
 }
 
 bool GPURegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI,
                                           int SPAdj, unsigned FIOperandNum,
                                           RegScavenger *RS) const {
-  // GPU has no stack - this should never be called
-  llvm_unreachable("GPU has no stack frame");
+  MachineInstr &Inst = *MI;
+  MachineBasicBlock &MBB = *Inst.getParent();
+  MachineFunction &MF = *MBB.getParent();
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+  DebugLoc DL = Inst.getDebugLoc();
+
+  int FrameIndex = Inst.getOperand(FIOperandNum).getIndex();
+  int Offset = MF.getFrameInfo().getObjectOffset(FrameIndex) +
+               MF.getFrameInfo().getStackSize();
+
+  unsigned Opc = Inst.getOpcode();
+  if (Opc == GPU::SPILL_GPR) {
+    Register SrcReg = Inst.getOperand(0).getReg();
+    BuildMI(MBB, MI, DL, TII.get(GPU::ST_SCATTER))
+        .addReg(GPU::R30)
+        .addReg(SrcReg)
+        .addImm(Offset);
+    Inst.eraseFromParent();
+  } else if (Opc == GPU::RELOAD_GPR) {
+    Register DstReg = Inst.getOperand(0).getReg();
+    BuildMI(MBB, MI, DL, TII.get(GPU::LD_SCATTER), DstReg)
+        .addReg(GPU::R30)
+        .addImm(Offset);
+    Inst.eraseFromParent();
+  } else {
+    llvm_unreachable("Unexpected instruction with frame index");
+  }
   return false;
 }
 
 Register GPURegisterInfo::getFrameRegister(const MachineFunction &MF) const {
-  // No frame pointer
-  return GPU::R31;
+  // Stack pointer register
+  return GPU::R30;
 }
