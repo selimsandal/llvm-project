@@ -228,7 +228,7 @@ static unsigned getImmediateOpcode(unsigned Opc) {
 // when t has no other uses between the MOVI and the ALU op.
 bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
   bool Changed = false;
-  SmallVector<std::pair<MachineInstr *, MachineInstr *>, 4> ToFold;
+  SmallVector<std::tuple<MachineInstr *, MachineInstr *, bool>, 4> ToFold;
 
   for (MachineInstr &MI : MBB) {
     unsigned ImmOpc = getImmediateOpcode(MI.getOpcode());
@@ -250,6 +250,23 @@ bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
     if (hasInterveningUse(MBB, MoviMI, &MI, Src1Reg))
       continue;
 
+    // Check if Src1Reg is used AFTER the ALU op — if so, keep the MOVI
+    bool UsedAfter = false;
+    {
+      auto It = std::next(MachineBasicBlock::iterator(&MI));
+      for (; It != MBB.end(); ++It) {
+        bool HasUse = false, HasDef = false;
+        for (const MachineOperand &MO : It->operands()) {
+          if (MO.isReg() && MO.getReg() == Src1Reg) {
+            if (MO.isUse()) HasUse = true;
+            if (MO.isDef()) HasDef = true;
+          }
+        }
+        if (HasUse) { UsedAfter = true; break; }
+        if (HasDef) break;
+      }
+    }
+
     // Found: MOVI(t, imm) + ALU(d, x, t) -> ALUi(d, x, imm)
     uint32_t ImmVal = MoviMI->getOperand(1).getImm();
     Register DstReg = MI.getOperand(0).getReg();
@@ -262,13 +279,14 @@ bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
         .addReg(Src0Reg)
         .addImm(ImmVal);
 
-    ToFold.push_back({MoviMI, &MI});
+    ToFold.push_back({MoviMI, &MI, UsedAfter});
     Changed = true;
   }
 
-  for (auto &[MoviMI, AluMI] : ToFold) {
+  for (auto &[MoviMI, AluMI, KeepMovi] : ToFold) {
     AluMI->eraseFromParent();
-    MoviMI->eraseFromParent();
+    if (!KeepMovi)
+      MoviMI->eraseFromParent();
   }
 
   return Changed;
@@ -327,9 +345,22 @@ bool GPUPeephole::foldSourceModifiers(MachineBasicBlock &MBB) {
         if (Src0Def && Src0Def->getOpcode() == GPU::MOVI &&
             Src0Def->getOperand(1).getImm() == 0 &&
             !hasInterveningUse(MBB, Src0Def, DefMI, FSUBSrc0)) {
+          // Only erase MOVI if the zero reg isn't used after the FSUB
+          bool ZeroUsedAfter = false;
+          auto ZIt = std::next(MachineBasicBlock::iterator(DefMI));
+          for (; ZIt != MBB.end(); ++ZIt) {
+            for (const MachineOperand &MO : ZIt->operands()) {
+              if (MO.isReg() && MO.isUse() && MO.getReg() == FSUBSrc0)
+                ZeroUsedAfter = true;
+              if (MO.isReg() && MO.isDef() && MO.getReg() == FSUBSrc0)
+                goto zero_scan_done;
+            }
+          }
+          zero_scan_done:
           Mod = 1; // NEG
           RealSrc = DefMI->getOperand(2).getReg();
-          ToErase.push_back(Src0Def);
+          if (!ZeroUsedAfter)
+            ToErase.push_back(Src0Def);
         }
       }
       // Pattern: ANDi(x, 0x7FFFFFFF) -> ABS(x)
