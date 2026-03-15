@@ -25,7 +25,7 @@
 //   register(u1/t1/b1)    → r2 (descriptor init_r2)
 //   register(u2/t2/b2)    → r3 (descriptor init_r3)
 //   register(u3/t3/b3)    → r4 (descriptor init_r4)
-//   Max 4 bindings (same as OpenCL's 4-arg limit).
+//   >4 bindings: all loaded indirectly from args buffer via r1.
 //
 // Wave Intrinsic → GPU REDUCE Mapping:
 //   WaveActiveSum          → REDUCE(ADD/FADD)
