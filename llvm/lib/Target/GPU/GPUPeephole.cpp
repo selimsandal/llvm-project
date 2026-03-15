@@ -402,6 +402,7 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
         auto Entry = IfStack.pop_back_val();
         int EndifSlot = SlotMap[&MI];
         if (Entry.ElseMI) {
+          // Hardware IF/ELSE skip: pc = pc_plus1 + imm32
           Entry.IfMI->getOperand(1).setImm(
               SlotMap[Entry.ElseMI] - SlotMap[Entry.IfMI] - 1);
           Entry.ElseMI->getOperand(0).setImm(EndifSlot -
@@ -422,12 +423,12 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
       case GPU::ENDLOOP_INST: {
         assert(!LoopStack.empty() && "ENDLOOP without LOOP");
         auto Entry = LoopStack.pop_back_val();
-        // Jump to instruction AFTER LOOP (+1 to skip the LOOP push).
-        MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI] + 1);
-        // BREAK skips forward to ENDLOOP (which pops the mask stack).
+        // Hardware ENDLOOP: pc = pc_plus1 + imm32. Target = LOOP + 1 (after LOOP push).
+        MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI]);
+        // BREAK: pc = pc_plus1 + imm32. Target = ENDLOOP slot.
         int EndloopSlot = SlotMap[&MI];
         for (auto *BreakMI : Entry.Breaks)
-          BreakMI->getOperand(1).setImm(EndloopSlot - SlotMap[BreakMI]);
+          BreakMI->getOperand(1).setImm(EndloopSlot - SlotMap[BreakMI] - 1);
         break;
       }
       default:
