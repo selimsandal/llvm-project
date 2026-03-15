@@ -217,6 +217,17 @@ def SEL : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPR:$src1, i32imm:$freg),
   let Uses = [F0]; // Reads flag register written by preceding CMP
 }
 
+// SEL with immediate src1: dst = flag ? src0 : imm32
+def SELi : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32, i32imm:$freg),
+  "sel\t$dst, $src0, $imm32", []> {
+  let opcode = 0x0E;
+  let imm_en = 1;
+  let hasSideEffects = 0;
+  let mayLoad = 0;
+  let mayStore = 0;
+  let Uses = [F0];
+}
+
 // Integer min/max — native single-cycle ALU instructions
 def SMINrr : GPUInstALU<0x16,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
@@ -484,6 +495,15 @@ def RELOAD_GPR : GPUPseudo<
   (outs GPR:$dst), (ins i32imm:$fi),
   "reload\t$dst, $fi", []>;
 }
+}
+
+// Loop-exit MOVI pseudo: emitted by processLoop for latch-exit phi copies.
+// Lowered to regular MOVI by GPUControlFlow post-merge pass, positioned
+// right before ENDLOOP so it executes with correct exec_mask.
+let hasSideEffects = 1, mayLoad = 0, mayStore = 0 in {
+def LOOP_EXIT_MOVI : GPUPseudo<
+  (outs GPR:$dst), (ins GPUimm32:$imm32),
+  "loop_exit_movi\t$dst, $imm32", []>;
 }
 
 // Conditional branch pseudo (lowered to IF/ELSE/ENDIF by GPUControlFlow pass)

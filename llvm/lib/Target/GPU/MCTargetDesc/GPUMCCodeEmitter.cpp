@@ -203,6 +203,16 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     flag_reg = MI.getOperand(3).getImm();
     break;
 
+  // SELi dst, src0, imm32, freg
+  case GPU::SELi:
+    opcode = 0x0E;
+    imm_en = 1;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    imm32 = MI.getOperand(2).getImm();
+    flag_reg = MI.getOperand(3).getImm();
+    break;
+
   // Memory: LDV dst, beat
   case GPU::LDV:
     opcode = 0x10;
