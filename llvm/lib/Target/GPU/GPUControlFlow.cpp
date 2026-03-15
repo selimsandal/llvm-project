@@ -295,24 +295,38 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
     if (ExitBB->pred_size() != 1)
       continue;
 
+    // Collect MOVI definitions to resolve COPY chains:
+    // Pattern: MOVI %x, imm; COPY %y, %x → SELi %y, imm
+    DenseMap<Register, int64_t> MoviDefs;
+    for (auto &MI : *ExitBB) {
+      if (MI.getOpcode() == GPU::MOVI)
+        MoviDefs[MI.getOperand(0).getReg()] = MI.getOperand(1).getImm();
+    }
+
     for (auto It = ExitBB->begin(); It != ExitBB->end();) {
       MachineInstr &MI = *It++;
       if (MI.getOpcode() == GPU::GPU_BR || MI.getOpcode() == GPU::GPU_BRCOND)
         continue;
-      if (MI.getOpcode() == GPU::MOV && MI.getOperand(0).isReg() &&
-          MI.getOperand(1).isReg()) {
-        // MOV dst, src → SEL dst, dst, src, LatchFReg
-        // flag=1 (continue): keep dst. flag=0 (exit): dst = src.
+      // MOV/COPY dst, src
+      if ((MI.getOpcode() == GPU::MOV || MI.isCopy()) &&
+          MI.getOperand(0).isReg() && MI.getOperand(1).isReg()) {
         Register DstReg = MI.getOperand(0).getReg();
         Register SrcReg = MI.getOperand(1).getReg();
-        BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL), DstReg)
-            .addReg(DstReg)
-            .addReg(SrcReg)
-            .addImm(LatchFReg);
+        auto MoviIt = MoviDefs.find(SrcReg);
+        if (MoviIt != MoviDefs.end()) {
+          // Source is a MOVI constant → LOOP_EXIT_MOVI (becomes SELi)
+          BuildMI(*ExitBB, MI.getIterator(), DebugLoc(),
+                  TII->get(GPU::LOOP_EXIT_MOVI), DstReg)
+              .addImm(MoviIt->second);
+        } else if (DstReg != SrcReg) {
+          // Source is a register → SEL dst, dst, src, LatchFReg
+          BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL), DstReg)
+              .addReg(DstReg)
+              .addReg(SrcReg)
+              .addImm(LatchFReg);
+        }
+        // DstReg == SrcReg: identity copy, skip
       } else if (MI.getOpcode() == GPU::MOVI) {
-        // Emit LOOP_EXIT_MOVI pseudo in the exit block.
-        // After mergeAllBlocks, this ends up after ENDLOOP.
-        // lowerLoopExitMovis will move it right before ENDLOOP.
         Register DstReg = MI.getOperand(0).getReg();
         int64_t ImmVal = MI.getOperand(1).getImm();
         BuildMI(*ExitBB, MI.getIterator(), DebugLoc(),
@@ -321,11 +335,11 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
       }
     }
 
-    // Clean up: erase MOV/MOVI/BR (LOOP_EXIT_MOVI survives)
+    // Clean up: erase MOV/COPY/MOVI/BR (LOOP_EXIT_MOVI survives)
     SmallVector<MachineInstr *, 4> ToErase;
     for (auto &MI : *ExitBB) {
-      if (MI.getOpcode() == GPU::MOV || MI.getOpcode() == GPU::MOVI ||
-          MI.getOpcode() == GPU::GPU_BR)
+      if (MI.getOpcode() == GPU::MOV || MI.isCopy() ||
+          MI.getOpcode() == GPU::MOVI || MI.getOpcode() == GPU::GPU_BR)
         ToErase.push_back(&MI);
     }
     for (auto *MI : ToErase)
