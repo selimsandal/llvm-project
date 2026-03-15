@@ -330,8 +330,28 @@ static const char *bindSlotToReg(unsigned Slot) {
   case 1: return "r2";
   case 2: return "r3";
   case 3: return "r4";
-  default: return nullptr; // Too many bindings
+  default: return nullptr;
   }
+}
+
+// Get the base address value for a binding slot.
+// When UseIndirect is false (≤4 bindings): reads from register (r1-r4).
+// When UseIndirect is true (>4 bindings): loads from args buffer [r1 + slot*4].
+static Value *getBindingBase(IRBuilder<> &Builder, Module &M,
+                             unsigned BindSlot, bool UseIndirect) {
+  if (!UseIndirect) {
+    const char *RegName = bindSlotToReg(BindSlot);
+    if (!RegName)
+      return nullptr;
+    return createRegRead(Builder, M, RegName);
+  }
+  // Indirect: r1 = args buffer pointer, load binding value from [r1 + slot*4]
+  Value *ArgsPtr = createRegRead(Builder, M, "r1");
+  Value *Offset = Builder.getInt32(BindSlot * 4);
+  Value *Addr = Builder.CreateAdd(ArgsPtr, Offset, "arg_addr");
+  Value *Ptr = Builder.CreateIntToPtr(Addr,
+      PointerType::getUnqual(M.getContext()), "arg_ptr");
+  return Builder.CreateLoad(Builder.getInt32Ty(), Ptr, "arg_val");
 }
 
 // Get element size in bytes from a target extension type.
@@ -374,6 +394,15 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     }
   }
 
+  // Count max binding slot to decide direct vs indirect path
+  unsigned MaxBindSlot = 0;
+  for (CallInst *CI : HandleCalls) {
+    auto *BindC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+    if (BindC)
+      MaxBindSlot = std::max(MaxBindSlot, (unsigned)BindC->getZExtValue());
+  }
+  bool UseIndirect = MaxBindSlot > 3;
+
   // Lower getpointer: (handle, index) → inttoptr(base + index * elem_size)
   for (CallInst *CI : GetPtrCalls) {
     Value *Handle = CI->getArgOperand(0);
@@ -383,14 +412,12 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     if (!getBindSlot(Handle, BindSlot))
       continue;
 
-    const char *RegName = bindSlotToReg(BindSlot);
-    if (!RegName)
-      continue; // Binding slot > 3, can't map
-
     unsigned ElemSize = getElementSize(Handle->getType(), DL);
 
     IRBuilder<> Builder(CI);
-    Value *Base = createRegRead(Builder, M, RegName);
+    Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
+    if (!Base)
+      continue;
 
     Value *Addr;
     if (ElemSize == 1) {
@@ -416,9 +443,6 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     unsigned BindSlot;
     if (!getBindSlot(Handle, BindSlot))
       continue;
-    const char *RegName = bindSlotToReg(BindSlot);
-    if (!RegName)
-      continue;
 
     unsigned ElemSize = getElementSize(Handle->getType(), DL);
 
@@ -427,7 +451,9 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     Type *ElemTy = RetTy->getElementType(0);
 
     IRBuilder<> Builder(CI);
-    Value *Base = createRegRead(Builder, M, RegName);
+    Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
+    if (!Base)
+      continue;
     Value *Offset = Builder.CreateMul(Index,
         Builder.getInt32(ElemSize), "idx_offset");
     Value *Addr = Builder.CreateAdd(Base, Offset, "addr");
@@ -456,14 +482,13 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     unsigned BindSlot;
     if (!getBindSlot(Handle, BindSlot))
       continue;
-    const char *RegName = bindSlotToReg(BindSlot);
-    if (!RegName)
-      continue;
 
     unsigned ElemSize = getElementSize(Handle->getType(), DL);
 
     IRBuilder<> Builder(CI);
-    Value *Base = createRegRead(Builder, M, RegName);
+    Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
+    if (!Base)
+      continue;
     Value *Offset = Builder.CreateMul(Index,
         Builder.getInt32(ElemSize), "idx_offset");
     Value *Addr = Builder.CreateAdd(Base, Offset, "addr");
