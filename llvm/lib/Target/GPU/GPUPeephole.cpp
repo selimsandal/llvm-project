@@ -251,7 +251,7 @@ bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
       continue;
 
     // Don't fold if the register has another definition earlier in the
-    // block. After mask-stack control flow (BREAK, IF/ELSE), a register
+    // block. After mask-stack control flow (BREAK, GOTO/JOIN), a register
     // may hold per-lane divergent values. The MOVI we found is the
     // nearest def, but an earlier def (e.g., inside a loop body before
     // ENDLOOP) means different lanes hold different values.
@@ -416,8 +416,13 @@ bool GPUPeephole::foldSourceModifiers(MachineBasicBlock &MBB) {
   return Changed;
 }
 
-// Compute IF/ELSE/ENDLOOP/BREAK offsets from final instruction slots.
+// Compute GOTO/BREAK/JUMP offsets from final instruction slots.
 // Must run after all instruction-count-changing optimizations (FMA, imm fold).
+//
+// Stack-based matching:
+//   GOTO pushes to GotoStack; JOIN pops and sets GOTO's JIP offset.
+//   WHILE pushes to LoopStack (with associated BREAKs); JOIN pops and sets
+//   all BREAK offsets. JUMP finds its enclosing WHILE and targets WHILE+1.
 void GPUPeephole::computeOffsets(MachineFunction &MF) {
   DenseMap<MachineInstr *, int> SlotMap;
   int Slot = 0;
@@ -426,14 +431,14 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
       if (!MI.isPseudo())
         SlotMap[&MI] = Slot++;
 
-  struct IfEntry {
-    MachineInstr *IfMI;
-    MachineInstr *ElseMI = nullptr;
+  struct GotoEntry {
+    MachineInstr *GotoMI;
   };
-  SmallVector<IfEntry, 8> IfStack;
+  SmallVector<GotoEntry, 8> GotoStack;
 
   struct LoopEntry {
-    MachineInstr *LoopMI;
+    MachineInstr *WhileMI;
+    SmallVector<MachineInstr *, 4> Breaks;
   };
   SmallVector<LoopEntry, 4> LoopStack;
 
@@ -443,39 +448,68 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
         continue;
 
       switch (MI.getOpcode()) {
-      case GPU::IF_INST:
-        IfStack.push_back({&MI});
+      case GPU::GOTO_INST:
+        GotoStack.push_back({&MI});
         break;
-      case GPU::ELSE_INST:
-        assert(!IfStack.empty() && "ELSE without IF");
-        IfStack.back().ElseMI = &MI;
+
+      case GPU::WHILE_INST:
+        LoopStack.push_back({&MI, {}});
         break;
-      case GPU::ENDIF_INST: {
-        assert(!IfStack.empty() && "ENDIF without IF");
-        auto Entry = IfStack.pop_back_val();
-        int EndifSlot = SlotMap[&MI];
-        if (Entry.ElseMI) {
-          // Hardware IF/ELSE skip: pc = pc_plus1 + imm32
-          Entry.IfMI->getOperand(1).setImm(
-              SlotMap[Entry.ElseMI] - SlotMap[Entry.IfMI] - 1);
-          Entry.ElseMI->getOperand(0).setImm(EndifSlot -
-                                              SlotMap[Entry.ElseMI] - 1);
-        } else {
-          Entry.IfMI->getOperand(1).setImm(EndifSlot -
-                                            SlotMap[Entry.IfMI] - 1);
+
+      case GPU::BREAK_INST: {
+        // Associate with innermost WHILE
+        assert(!LoopStack.empty() && "BREAK without WHILE");
+        LoopStack.back().Breaks.push_back(&MI);
+        break;
+      }
+
+      case GPU::JUMP_INST: {
+        // Target = instruction after WHILE (WHILE+1), i.e. first loop body instr.
+        // pc = pc_plus1 + offset → offset = target - (jump+1) = while_slot+1 - jump_slot - 1
+        assert(!LoopStack.empty() && "JUMP without WHILE");
+        int WhileSlot = SlotMap[LoopStack.back().WhileMI];
+        int JumpSlot = SlotMap[&MI];
+        // Target is WHILE+1 (first instruction after WHILE push)
+        MI.getOperand(0).setImm(WhileSlot - JumpSlot);
+        break;
+      }
+
+      case GPU::JOIN_INST: {
+        int JoinSlot = SlotMap[&MI];
+
+        // JOIN matches either a GOTO (forward divergence) or a WHILE (loop exit).
+        // Check which stack has the innermost entry.
+        bool HaveGoto = !GotoStack.empty();
+        bool HaveLoop = !LoopStack.empty();
+
+        if (HaveGoto && HaveLoop) {
+          // Both stacks non-empty: the one with the higher slot is innermost
+          int GotoSlot = SlotMap[GotoStack.back().GotoMI];
+          int WhileSlot = SlotMap[LoopStack.back().WhileMI];
+          if (GotoSlot > WhileSlot)
+            HaveLoop = false;  // GOTO is inner
+          else
+            HaveGoto = false;  // WHILE is inner
+        }
+
+        if (HaveGoto) {
+          // Match GOTO → JOIN: set GOTO's JIP offset
+          auto Entry = GotoStack.pop_back_val();
+          // GOTO JIP: pc = pc_plus1 + imm32 → offset = JoinSlot - GotoSlot - 1
+          Entry.GotoMI->getOperand(2).setImm(JoinSlot -
+                                              SlotMap[Entry.GotoMI] - 1);
+        } else if (HaveLoop) {
+          // Match WHILE → JOIN: set all BREAKs' target offsets
+          auto Entry = LoopStack.pop_back_val();
+          for (auto *BreakMI : Entry.Breaks) {
+            // BREAK target: pc = pc_plus1 + imm32
+            BreakMI->getOperand(2).setImm(JoinSlot -
+                                           SlotMap[BreakMI] - 1);
+          }
         }
         break;
       }
-      case GPU::LOOP_INST:
-        LoopStack.push_back({&MI});
-        break;
-      case GPU::ENDLOOP_INST: {
-        assert(!LoopStack.empty() && "ENDLOOP without LOOP");
-        auto Entry = LoopStack.pop_back_val();
-        // Hardware ENDLOOP: pc = pc_plus1 + imm32. Target = LOOP + 1 (after LOOP push).
-        MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI]);
-        break;
-      }
+
       default:
         break;
       }
