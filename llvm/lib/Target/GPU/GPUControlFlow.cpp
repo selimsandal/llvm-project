@@ -103,7 +103,6 @@ private:
   bool mergeAllBlocks(MachineFunction &MF);
   bool ensureHalt(MachineFunction &MF);
   void lowerLoopExitMovis(MachineFunction &MF);
-  void fixBreaksInsideIf(MachineFunction &MF);
   void computeOffsets(MachineFunction &MF);
 };
 
@@ -253,6 +252,33 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
     // These values will be "frozen" for lanes that BREAK deactivates.
     {
       MachineFunction &MF = *BB->getParent();
+
+      // Check if ExitBB will become unreachable after removing this edge.
+      // If so, the cloned code is exclusive to the break path — wrap it
+      // in IF/ENDIF so only break-lanes execute it (non-break lanes must
+      // preserve their registers for the in-loop continuation path).
+      // If ExitBB has other predecessors, the same code runs post-loop
+      // for all lanes, so wrapping would cause the post-loop copy to
+      // overwrite break-lanes with wrong values.
+      bool WrapInIf = false;
+      if (ExitBB->pred_size() == 1) {
+        // ExitBB only reachable from this break — will be cleared below.
+        // Check if it has non-terminator instructions worth guarding.
+        for (auto &MI : *ExitBB) {
+          if (MI.isTerminator() || MI.getOpcode() == GPU::GPU_BR ||
+              MI.getOpcode() == GPU::GPU_BRCOND)
+            continue;
+          WrapInIf = true;
+          break;
+        }
+      }
+
+      if (WrapInIf) {
+        BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::IF_INST))
+            .addImm(BreakFReg)
+            .addImm(0);
+      }
+
       for (auto &MI : *ExitBB) {
         if (MI.isTerminator() || MI.getOpcode() == GPU::GPU_BR ||
             MI.getOpcode() == GPU::GPU_BRCOND)
@@ -260,12 +286,16 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
         MachineInstr *Clone = MF.CloneMachineInstr(&MI);
         BB->insert(BB->end(), Clone);
       }
+
+      if (WrapInIf) {
+        BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::ENDIF_INST));
+      }
     }
 
-    // Insert BREAK after cloned exit instructions
+    // Insert BREAK after cloned exit instructions (outside IF/ENDIF)
+    // BREAK sets break_mask and clears exec_mask — no jump, no offset needed.
     BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
-        .addImm(BreakFReg)
-        .addImm(0); // offset computed later
+        .addImm(BreakFReg);
 
     // Update CFG: remove exit edge, keep in-loop edge
     BB->removeSuccessor(ExitBB);
@@ -647,6 +677,35 @@ bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
       if (TruePath->succ_size() == 1 && FalsePath->succ_size() == 1 &&
           *TruePath->succ_begin() == *FalsePath->succ_begin()) {
         MachineBasicBlock *MergeBB = *TruePath->succ_begin();
+
+        // When FalseBB has multiple predecessors (funnel pattern from
+        // cascaded conditionals sharing a skip target), forming a diamond
+        // creates incorrect mask-stack nesting: the outer ELSE fires
+        // before inner ENDIFs close, corrupting exec_mask.
+        //
+        // Fix: redirect CondBB's false edge to MergeBB and process as
+        // triangle-true. Inner levels become properly nested triangles.
+        // Once all inner predecessors are redirected, FalseBB becomes
+        // single-predecessor and the outermost level forms a valid diamond.
+        if (FalsePath->pred_size() > 1) {
+          MBB.removeSuccessor(FalsePath);
+          if (!MBB.isSuccessor(MergeBB))
+            MBB.addSuccessor(MergeBB);
+
+          // FalseBB may now be single-predecessor — merge it into its
+          // predecessor chain so the next iteration sees the correct CFG.
+          if (FalsePath->pred_size() == 1) {
+            MachineBasicBlock *Pred = *FalsePath->pred_begin();
+            if (Pred->succ_size() == 1)
+              mergeLinearChain(*Pred);
+          }
+
+          processTriangleTrue(MF, MBB, TruePath, MergeBB, Info.FReg);
+          Changed = true;
+          Progress = true;
+          break;
+        }
+
         processDiamond(MF, MBB, TruePath, FalsePath, MergeBB, Info.FReg);
         Changed = true;
         Progress = true;
@@ -777,7 +836,6 @@ void GPUControlFlow::computeOffsets(MachineFunction &MF) {
 
   struct LoopEntry {
     MachineInstr *LoopMI;
-    SmallVector<MachineInstr *, 2> Breaks;
   };
   SmallVector<LoopEntry, 4> LoopStack;
 
@@ -810,11 +868,7 @@ void GPUControlFlow::computeOffsets(MachineFunction &MF) {
         break;
       }
       case GPU::LOOP_INST:
-        LoopStack.push_back({&MI, {}});
-        break;
-      case GPU::BREAK_INST:
-        assert(!LoopStack.empty() && "BREAK without LOOP");
-        LoopStack.back().Breaks.push_back(&MI);
+        LoopStack.push_back({&MI});
         break;
       case GPU::ENDLOOP_INST: {
         assert(!LoopStack.empty() && "ENDLOOP without LOOP");
@@ -822,10 +876,6 @@ void GPUControlFlow::computeOffsets(MachineFunction &MF) {
         // ENDLOOP jumps to instruction AFTER LOOP (+1 to skip LOOP itself,
         // which pushes the mask stack and must only execute once at entry).
         MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI] + 1);
-        // BREAK skips forward to ENDLOOP (which pops the mask stack).
-        int EndloopSlot = SlotMap[&MI];
-        for (auto *BreakMI : Entry.Breaks)
-          BreakMI->getOperand(1).setImm(EndloopSlot - SlotMap[BreakMI]);
         break;
       }
       default:

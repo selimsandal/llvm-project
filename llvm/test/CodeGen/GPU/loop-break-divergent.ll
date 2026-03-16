@@ -1,9 +1,11 @@
 ; RUN: llc -march=gpu < %s | FileCheck %s
 
 ; Loop with break and divergent exit phi values.
-; The exit-block instructions must be cloned before BREAK (Bug 1 fix),
-; and the exhausted-path PHI copy must run inside the loop before ENDLOOP
-; with the correct exec_mask (Bug 2 fix).
+; Exit-block instructions are cloned before BREAK so breaking lanes have
+; correct register values. The exhausted-path PHI copy (SELi) runs inside
+; the loop before ENDLOOP with the correct exec_mask. BREAK sets break_mask
+; and clears exec_mask (no jump) — ENDIF/ELSE apply ~break_mask to prevent
+; re-activating broken lanes.
 
 define void @loop_break_phi(i32 %n, ptr %arr, ptr %out) {
 ; Exit-block store is cloned before BREAK

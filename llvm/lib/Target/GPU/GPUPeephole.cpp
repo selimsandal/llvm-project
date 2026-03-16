@@ -434,7 +434,6 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
 
   struct LoopEntry {
     MachineInstr *LoopMI;
-    SmallVector<MachineInstr *, 2> Breaks;
   };
   SmallVector<LoopEntry, 4> LoopStack;
 
@@ -468,21 +467,13 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
         break;
       }
       case GPU::LOOP_INST:
-        LoopStack.push_back({&MI, {}});
-        break;
-      case GPU::BREAK_INST:
-        assert(!LoopStack.empty() && "BREAK without LOOP");
-        LoopStack.back().Breaks.push_back(&MI);
+        LoopStack.push_back({&MI});
         break;
       case GPU::ENDLOOP_INST: {
         assert(!LoopStack.empty() && "ENDLOOP without LOOP");
         auto Entry = LoopStack.pop_back_val();
         // Hardware ENDLOOP: pc = pc_plus1 + imm32. Target = LOOP + 1 (after LOOP push).
         MI.getOperand(1).setImm(SlotMap[Entry.LoopMI] - SlotMap[&MI]);
-        // BREAK: pc = pc_plus1 + imm32. Target = ENDLOOP slot.
-        int EndloopSlot = SlotMap[&MI];
-        for (auto *BreakMI : Entry.Breaks)
-          BreakMI->getOperand(1).setImm(EndloopSlot - SlotMap[BreakMI] - 1);
         break;
       }
       default:
