@@ -337,9 +337,7 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
 
   case GPU::BREAK_INST:
     opcode = 0x45;
-    imm_en = 1;
     flag_reg = MI.getOperand(0).getImm();
-    imm32 = MI.getOperand(1).getImm();
     break;
 
   case GPU::HALT:

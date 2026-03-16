@@ -447,10 +447,8 @@ def ENDLOOP_INST : GPUInstCF<0x44,
 }
 
 def BREAK_INST : GPUInstCF<0x45,
-  (outs), (ins i32imm:$freg, GPUimm32:$imm32),
-  "break\tf$freg, $imm32", []> {
-  let imm_en = 1;
-}
+  (outs), (ins i32imm:$freg),
+  "break\tf$freg", []>;
 
 let isTerminator = 1, isReturn = 1, isBarrier = 1 in {
 def HALT : GPUInst<(outs), (ins), "halt",
