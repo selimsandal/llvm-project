@@ -416,39 +416,47 @@ def CMPri : GPUInst<
 // Control Flow Instructions (0x4_)
 //===--------------------------------------------------------------===//
 
+// Predication mode operand for GOTO/BREAK (maps to pred field in encoding)
+// 1 = PRED_IF (execute if flag set), 2 = PRED_IF_NOT (execute if flag clear)
+def GPUPredMode : Operand<i32> {
+  let PrintMethod = "printPredModeOperand";
+}
+
 let hasSideEffects = 1 in {
 
-// Mask-stack operations — NOT terminators/branches from LLVM's perspective.
-// The control flow pass inserts these into the middle of a linearized block.
-def IF_INST : GPUInstCF<0x40,
-  (outs), (ins i32imm:$freg, GPUimm32:$imm32),
-  "if\tf$freg, $imm32", []> {
+// GOTO: flag-conditional diverge. Pushes exec_mask, masks lanes by flag.
+// pred field selects polarity (PRED_IF=1 or PRED_IF_NOT=2).
+// imm32 = JIP offset (skip distance when all lanes fail).
+def GOTO_INST : GPUInstCF<0x40,
+  (outs), (ins FlagRC:$flag, GPUPredMode:$pred_mode, brtarget:$offset),
+  "goto\t$flag, $offset", []> {
   let imm_en = 1;
 }
 
-def ELSE_INST : GPUInstCF<0x41,
-  (outs), (ins GPUimm32:$imm32),
-  "else\t$imm32", []> {
-  let imm_en = 1;
-}
-
-def ENDIF_INST : GPUInstCF<0x42,
+// JOIN: reconverge (pop mask stack). No operands.
+def JOIN_INST : GPUInstCF<0x41,
   (outs), (ins),
-  "endif", []>;
+  "join", []>;
 
-def LOOP_INST : GPUInstCF<0x43,
+// WHILE: loop init (push empty mask). No operands.
+def WHILE_INST : GPUInstCF<0x42,
   (outs), (ins),
-  "loop", []>;
+  "while", []>;
 
-def ENDLOOP_INST : GPUInstCF<0x44,
-  (outs), (ins i32imm:$freg, GPUimm32:$imm32),
-  "endloop\tf$freg, $imm32", []> {
+// BREAK: accumulate exiting lanes into loop entry.
+// pred field selects flag polarity. imm32 = target offset.
+def BREAK_INST : GPUInstCF<0x43,
+  (outs), (ins FlagRC:$flag, GPUPredMode:$pred_mode, brtarget:$offset),
+  "break\t$flag, $offset", []> {
   let imm_en = 1;
 }
 
-def BREAK_INST : GPUInstCF<0x45,
-  (outs), (ins i32imm:$freg),
-  "break\tf$freg", []>;
+// JUMP: unconditional branch. imm32 = target offset.
+def JUMP_INST : GPUInstCF<0x44,
+  (outs), (ins brtarget:$offset),
+  "jump\t$offset", []> {
+  let imm_en = 1;
+}
 
 let isTerminator = 1, isReturn = 1, isBarrier = 1 in {
 def HALT : GPUInst<(outs), (ins), "halt",
@@ -495,16 +503,7 @@ def RELOAD_GPR : GPUPseudo<
 }
 }
 
-// Loop-exit MOVI pseudo: emitted by processLoop for latch-exit phi copies.
-// Lowered to regular MOVI by GPUControlFlow post-merge pass, positioned
-// right before ENDLOOP so it executes with correct exec_mask.
-let hasSideEffects = 1, mayLoad = 0, mayStore = 0 in {
-def LOOP_EXIT_MOVI : GPUPseudo<
-  (outs GPR:$dst), (ins GPUimm32:$imm32),
-  "loop_exit_movi\t$dst, $imm32", []>;
-}
-
-// Conditional branch pseudo (lowered to IF/ELSE/ENDIF by GPUControlFlow pass)
+// Conditional branch pseudo (lowered to control flow by GPUControlFlow pass)
 // Uses F0 to keep the CMP that writes F0 alive through dead code elimination.
 let isBranch = 1, isTerminator = 1, hasSideEffects = 0,
     mayLoad = 0, mayStore = 0 in {

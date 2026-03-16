@@ -307,37 +307,41 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     break;
 
   // Control flow
-  case GPU::IF_INST:
+  // GOTO: flag-conditional diverge. flag_reg from operand 0, pred from
+  // operand 1 (GPUPredMode: 1=PRED_IF, 2=PRED_IF_NOT), imm32 from operand 2.
+  case GPU::GOTO_INST:
     opcode = 0x40;
     imm_en = 1;
-    flag_reg = MI.getOperand(0).getImm();
-    imm32 = MI.getOperand(1).getImm();
+    flag_reg = getRegEncoding(MI.getOperand(0).getReg());
+    pred = MI.getOperand(1).getImm();
+    imm32 = MI.getOperand(2).getImm();
     break;
 
-  case GPU::ELSE_INST:
+  // JOIN: reconverge (pop stack). No operands.
+  case GPU::JOIN_INST:
     opcode = 0x41;
-    imm_en = 1;
-    imm32 = MI.getOperand(0).getImm();
     break;
 
-  case GPU::ENDIF_INST:
+  // WHILE: loop init (push empty). No operands.
+  case GPU::WHILE_INST:
     opcode = 0x42;
     break;
 
-  case GPU::LOOP_INST:
+  // BREAK: accumulate exiting lanes. flag_reg from operand 0, pred from
+  // operand 1 (GPUPredMode), imm32 from operand 2.
+  case GPU::BREAK_INST:
     opcode = 0x43;
+    imm_en = 1;
+    flag_reg = getRegEncoding(MI.getOperand(0).getReg());
+    pred = MI.getOperand(1).getImm();
+    imm32 = MI.getOperand(2).getImm();
     break;
 
-  case GPU::ENDLOOP_INST:
+  // JUMP: unconditional branch. imm32 from operand 0.
+  case GPU::JUMP_INST:
     opcode = 0x44;
     imm_en = 1;
-    flag_reg = MI.getOperand(0).getImm();
-    imm32 = MI.getOperand(1).getImm();
-    break;
-
-  case GPU::BREAK_INST:
-    opcode = 0x45;
-    flag_reg = MI.getOperand(0).getImm();
+    imm32 = MI.getOperand(0).getImm();
     break;
 
   case GPU::HALT:
