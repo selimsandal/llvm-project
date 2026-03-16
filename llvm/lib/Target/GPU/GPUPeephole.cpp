@@ -17,6 +17,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
@@ -442,6 +443,13 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
   };
   SmallVector<LoopEntry, 4> LoopStack;
 
+  // Track hardware mask stack depth (GOTO and WHILE both push, JOIN pops).
+  // The hardware has an 8-entry stack; overflow wraps silently and corrupts
+  // execution masks. Catch it here at compile time.
+  static constexpr unsigned MaskStackLimit = 8;
+  unsigned MaskStackDepth = 0;
+  unsigned MaxMaskStackDepth = 0;
+
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : MBB) {
       if (MI.isPseudo())
@@ -450,10 +458,26 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
       switch (MI.getOpcode()) {
       case GPU::GOTO_INST:
         GotoStack.push_back({&MI});
+        ++MaskStackDepth;
+        if (MaskStackDepth > MaxMaskStackDepth)
+          MaxMaskStackDepth = MaskStackDepth;
+        if (MaskStackDepth > MaskStackLimit)
+          report_fatal_error("GPU mask stack overflow: nesting depth " +
+                             Twine(MaskStackDepth) + " exceeds hardware limit " +
+                             Twine(MaskStackLimit) + " in function " +
+                             MF.getName());
         break;
 
       case GPU::WHILE_INST:
         LoopStack.push_back({&MI, {}});
+        ++MaskStackDepth;
+        if (MaskStackDepth > MaxMaskStackDepth)
+          MaxMaskStackDepth = MaskStackDepth;
+        if (MaskStackDepth > MaskStackLimit)
+          report_fatal_error("GPU mask stack overflow: nesting depth " +
+                             Twine(MaskStackDepth) + " exceeds hardware limit " +
+                             Twine(MaskStackLimit) + " in function " +
+                             MF.getName());
         break;
 
       case GPU::BREAK_INST: {
@@ -476,6 +500,8 @@ void GPUPeephole::computeOffsets(MachineFunction &MF) {
 
       case GPU::JOIN_INST: {
         int JoinSlot = SlotMap[&MI];
+        if (MaskStackDepth > 0)
+          --MaskStackDepth;
 
         // JOIN matches either a GOTO (forward divergence) or a WHILE (loop exit).
         // Check which stack has the innermost entry.
