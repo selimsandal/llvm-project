@@ -2,8 +2,10 @@
 
 ; Simple counted loop
 define i32 @test_sum_loop(ptr %arr, i32 %n) {
-; CHECK: loop
-; CHECK: endloop
+; CHECK: while
+; CHECK: break
+; CHECK: jump
+; CHECK: join
 ; CHECK: halt
 entry:
   %cmp0 = icmp sgt i32 %n, 0

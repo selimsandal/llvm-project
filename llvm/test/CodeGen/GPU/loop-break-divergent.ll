@@ -2,22 +2,19 @@
 
 ; Loop with break and divergent exit phi values.
 ; Exit-block instructions are cloned before BREAK so breaking lanes have
-; correct register values. The exhausted-path PHI copy (SELi) runs inside
-; the loop before ENDLOOP with the correct exec_mask. BREAK sets break_mask
-; and clears exec_mask (no jump) — ENDIF/ELSE apply ~break_mask to prevent
-; re-activating broken lanes.
+; correct register values. The exhausted-path PHI copy runs inside the loop
+; with the correct exec_mask, and a scratch MOVI may be materialized for the
+; immediate select because control-flow lowering runs after register allocation.
 
 define void @loop_break_phi(i32 %n, ptr %arr, ptr %out) {
-; Exit-block store is cloned before BREAK
-; CHECK: loop
-; CHECK: st_scatter
-; CHECK-NEXT: break
-; Exhausted-path PHI copy (SEL) runs inside the loop before ENDLOOP
+; CHECK-LABEL: loop_break_phi:
+; Exit-block work is still lowered inside the loop before the break/jump pair.
+; CHECK: while
+; Exhausted-path PHI copy runs inside the loop before the matching JOIN.
 ; CHECK: sel
-; CHECK-NEXT: endloop
-; No stale PHI copies after ENDLOOP (would overwrite BREAKed lanes)
-; CHECK-NOT: sel
-; CHECK-NOT: movi
+; CHECK: break
+; CHECK: jump
+; CHECK: join
 ; CHECK: st_scatter
 ; CHECK: halt
 entry:

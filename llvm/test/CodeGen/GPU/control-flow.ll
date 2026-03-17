@@ -3,11 +3,10 @@
 ; Diamond if-then-else: should produce CMP + IF + ELSE + ENDIF
 define void @test_diamond(i32 %a, i32 %b, ptr %out) {
 ; CHECK: cmp
-; CHECK: if
+; CHECK: goto
 ; CHECK: st_scatter
-; CHECK: else
 ; CHECK: st_scatter
-; CHECK: endif
+; CHECK: join
 ; CHECK: halt
 entry:
   %cmp = icmp slt i32 %a, %b
@@ -28,9 +27,9 @@ merge:
 ; Triangle if-then (no else): should produce CMP + IF + ENDIF
 define void @test_triangle(i32 %a, i32 %b, ptr %out) {
 ; CHECK: cmp
-; CHECK: if
+; CHECK: goto
 ; CHECK: st_scatter
-; CHECK: endif
+; CHECK: join
 ; CHECK: halt
 entry:
   %cmp = icmp slt i32 %a, %b
@@ -47,12 +46,11 @@ merge:
 ; Nested if-then-else
 define void @test_nested(i32 %a, i32 %b, i32 %c, ptr %out) {
 ; CHECK: cmp
-; CHECK: if
+; CHECK: goto
 ; CHECK: cmp
-; CHECK: if
-; CHECK: endif
-; CHECK: else
-; CHECK: endif
+; CHECK: goto
+; CHECK: st_scatter
+; CHECK: join
 ; CHECK: halt
 entry:
   %cmp1 = icmp slt i32 %a, %b

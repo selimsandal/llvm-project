@@ -4,8 +4,10 @@
 ; Test 1: Simple loop with counter
 define void @test_loop_sum(ptr %out) {
 ; CHECK-LABEL: test_loop_sum:
-; CHECK: loop
-; CHECK: endloop
+; CHECK: while
+; CHECK: break
+; CHECK: jump
+; CHECK: join
 ; CHECK: st_scatter
 entry:
   br label %loop
@@ -24,9 +26,10 @@ exit:
 ; Test 2: Loop with simple break (single exit value)
 define void @test_loop_break(ptr %out) {
 ; CHECK-LABEL: test_loop_break:
-; CHECK: loop
+; CHECK: while
 ; CHECK: break
-; CHECK: endloop
+; CHECK: jump
+; CHECK: join
 entry:
   br label %loop
 loop:
@@ -82,8 +85,9 @@ merge:
 ; Test 5: Triangle (then-only, no else body)
 define void @test_triangle(i32 %x, ptr %out) {
 ; CHECK-LABEL: test_triangle:
-; CHECK: if
+; CHECK: goto
 ; CHECK: st_scatter
+; CHECK: join
 entry:
   store i32 99, ptr %out
   %cmp = icmp sgt i32 %x, 50
