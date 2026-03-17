@@ -34,7 +34,9 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/InitializePasses.h"
 
@@ -76,6 +78,9 @@ private:
   void removeBranchPseudos(MachineBasicBlock &MBB);
   void processLoop(MachineLoop *L);
   bool processAllConditionals(MachineFunction &MF);
+  Register findScratchGPR(MachineBasicBlock &MBB,
+                          Register Avoid0 = Register(),
+                          Register Avoid1 = Register()) const;
 
   void processDiamond(MachineFunction &MF, MachineBasicBlock &CondBB,
                       MachineBasicBlock *TrueBB, MachineBasicBlock *FalseBB,
@@ -183,6 +188,34 @@ void GPUControlFlow::removeBranchPseudos(MachineBasicBlock &MBB) {
   }
 }
 
+Register GPUControlFlow::findScratchGPR(MachineBasicBlock &MBB,
+                                        Register Avoid0,
+                                        Register Avoid1) const {
+  static const MCPhysReg Candidates[] = {
+      GPU::R29, GPU::R28, GPU::R27, GPU::R26, GPU::R25, GPU::R24, GPU::R23,
+      GPU::R22, GPU::R21, GPU::R20, GPU::R19, GPU::R18, GPU::R17, GPU::R16,
+      GPU::R15, GPU::R14, GPU::R13, GPU::R12, GPU::R11, GPU::R10, GPU::R9,
+      GPU::R8,  GPU::R7,  GPU::R6,  GPU::R5,  GPU::R4,  GPU::R3,  GPU::R2,
+      GPU::R1,  GPU::R31};
+  const TargetRegisterInfo *TRI = MBB.getParent()->getSubtarget().getRegisterInfo();
+
+  for (MCPhysReg Reg : Candidates) {
+    bool LiveOut = false;
+    if (Reg == Avoid0 || Reg == Avoid1)
+      continue;
+    for (const auto &LiveOutReg : MBB.liveouts()) {
+      if (TRI->regsOverlap(Reg, LiveOutReg.PhysReg)) {
+        LiveOut = true;
+        break;
+      }
+    }
+    if (!LiveOut)
+      return Reg;
+  }
+
+  return Register();
+}
+
 void GPUControlFlow::processLoop(MachineLoop *L) {
   for (MachineLoop *InnerLoop : *L)
     processLoop(InnerLoop);
@@ -270,46 +303,61 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
 
       removeBranchPseudos(*Latch);
 
-      // Convert latch-exit block instructions to flag-gated SELs.
-      // The latch CMP set flag_reg. BREAK will take lanes matching BreakPred.
-      // For each MOV/MOVI in the exit block, use SELi so only exiting lanes
-      // get the exit value while continuing lanes keep their current value.
-      // Without this, exit-block instructions run after JOIN and overwrite
-      // ALL lanes including early-break lanes (destroying their values).
+      // Convert latch-exit MOV/MOVI assignments to flag-gated SELs.
+      // These are typically PHI/copy materializations that should apply only
+      // to lanes exiting through the latch. Other instructions in the exit
+      // block (stores, arithmetic, common post-loop work) must remain after
+      // JOIN so all exiting lanes execute them, including lanes that broke
+      // out of the loop earlier.
+      //
+      // The old code cleared the whole exit block, which dropped real work on
+      // mixed exit blocks. The safe behavior is to hoist only convertible
+      // MOV/MOVI instructions and leave everything else in place.
       if (LatchExitBB && LatchExitBB->pred_size() == 1) {
-        bool IsIfNot = (BreakPred == 2);  // PRED_IF_NOT: exiting = flag=0
+        bool ExitOnFlagTrue = (BreakPred == 1);
+        SmallVector<MachineInstr *, 8> ToDel;
         for (auto &MI : *LatchExitBB) {
           if (MI.isTerminator() || MI.isDebugInstr())
             continue;
           unsigned Opc = MI.getOpcode();
-          if (Opc == GPU::MOVI && IsIfNot) {
-            // MOVI rX, val → SELi rX, flag, rX, val
-            // flag=1 (continuing) → rX (keep), flag=0 (exiting) → val
+          if (Opc == GPU::MOVI) {
+            // MOVI rX, imm → materialize imm in a dead physical register, then
+            // select between the exit value and the current destination based
+            // on which flag value exits the loop. This pass runs post-RA, so
+            // creating virtual registers here is not legal.
             Register DstReg = MI.getOperand(0).getReg();
             int64_t Imm = MI.getOperand(1).getImm();
-            BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SELi))
-                .addReg(DstReg, RegState::Define)
-                .addReg(DstReg)
-                .addImm(Imm)
-                .addImm(LatchBI.FReg);
-          } else if (Opc == GPU::MOV && IsIfNot) {
-            // MOV rX, rY → SEL rX, flag, rX, rY
-            // flag=1 (continuing) → rX (keep), flag=0 (exiting) → rY
+            Register TmpReg = findScratchGPR(*Latch, DstReg);
+            if (!TmpReg)
+              report_fatal_error("GPUControlFlow: no scratch GPR available for latch-exit MOVI hoist");
+            BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::MOVI))
+                .addReg(TmpReg, RegState::Define)
+                .addImm(Imm);
+            MachineInstrBuilder SelMI =
+                BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL))
+                    .addReg(DstReg, RegState::Define);
+            if (ExitOnFlagTrue)
+              SelMI.addReg(TmpReg).addReg(DstReg);
+            else
+              SelMI.addReg(DstReg).addReg(TmpReg);
+            SelMI.addImm(LatchBI.FReg);
+            ToDel.push_back(&MI);
+          } else if (Opc == GPU::MOV) {
+            // MOV rX, rY → SEL rX, exit_value, keep_value or the opposite,
+            // depending on whether flag=1 or flag=0 exits the loop.
             Register DstReg = MI.getOperand(0).getReg();
             Register SrcReg = MI.getOperand(1).getReg();
-            BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL))
-                .addReg(DstReg, RegState::Define)
-                .addReg(DstReg)
-                .addReg(SrcReg)
-                .addImm(LatchBI.FReg);
-          }
-          // Skip non-MOV/MOVI instructions (rare in exit blocks)
-        }
-        // Clear exit block so instructions don't run after JOIN
-        SmallVector<MachineInstr *, 8> ToDel;
-        for (auto &MI : *LatchExitBB)
-          if (!MI.isTerminator() && !MI.isDebugInstr())
+            MachineInstrBuilder SelMI =
+                BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL))
+                    .addReg(DstReg, RegState::Define);
+            if (ExitOnFlagTrue)
+              SelMI.addReg(SrcReg).addReg(DstReg);
+            else
+              SelMI.addReg(DstReg).addReg(SrcReg);
+            SelMI.addImm(LatchBI.FReg);
             ToDel.push_back(&MI);
+          }
+        }
         for (auto *MI : ToDel)
           MI->eraseFromParent();
       }
@@ -355,6 +403,7 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
       break;
     if (!L->contains(Next))
       break;
+    removeBranchPseudos(*Header);
     Header->splice(Header->end(), Next, Next->begin(), Next->end());
     Header->removeSuccessor(Next);
     SmallVector<MachineBasicBlock *, 4> Succs(Next->succ_begin(),
@@ -441,6 +490,7 @@ void GPUControlFlow::mergeLinearChain(MachineBasicBlock &Head) {
     if (Next->pred_size() != 1)
       break;
 
+    removeBranchPseudos(Head);
     Head.splice(Head.end(), Next, Next->begin(), Next->end());
 
     Head.removeSuccessor(Next);
@@ -749,13 +799,12 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
   for (auto &MBB : MF) {
     if (MBB.succ_empty()) continue;
     // Check if block ends with an explicit terminator for all paths
-    bool HasBR = false, HasBRCOND = false, HasHALT = false;
+    bool HasBR = false, HasHALT = false;
     for (auto It = MBB.end(); It != MBB.begin();) {
       --It;
       if (It->isDebugInstr()) continue;
       if (!It->isTerminator()) break;
       if (It->getOpcode() == GPU::GPU_BR) HasBR = true;
-      if (It->getOpcode() == GPU::GPU_BRCOND) HasBRCOND = true;
       if (It->getOpcode() == GPU::HALT) HasHALT = true;
     }
     if (HasHALT || HasBR) continue;
@@ -790,23 +839,21 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
   // Phase 4: Convert conditionals to GOTO/JOIN
   Changed |= processAllConditionals(MF);
 
-  // Phase 4b: Remove remaining unconditional branch pseudos
+  // Phase 4b: Remove remaining unconditional branch pseudos anywhere in the
+  // block. After loop/conditional lowering they are only CFG bookkeeping, and
+  // merged blocks can otherwise leave stale GPU_BR instructions stranded in
+  // the middle of a block.
   for (auto &MBB : MF) {
-    auto I = MBB.end();
-    while (I != MBB.begin()) {
-      --I;
-      if (I->isDebugInstr())
-        continue;
-      if (!I->isTerminator())
-        break;
-      if (I->getOpcode() == GPU::GPU_BR) {
-        I->eraseFromParent();
-        I = MBB.end();
-        Changed = true;
-      } else {
-        break;
-      }
+    SmallVector<MachineInstr *, 4> ToErase;
+    for (auto &MI : MBB) {
+      if (MI.getOpcode() == GPU::GPU_BR)
+        ToErase.push_back(&MI);
+      if (MI.getOpcode() == GPU::GPU_BRCOND)
+        report_fatal_error("GPUControlFlow: unlowered GPU_BRCOND survived conditional lowering");
     }
+    for (auto *MI : ToErase)
+      MI->eraseFromParent();
+    Changed |= !ToErase.empty();
   }
 
   // Phase 5a: Reorder blocks to reverse post-order (RPO).

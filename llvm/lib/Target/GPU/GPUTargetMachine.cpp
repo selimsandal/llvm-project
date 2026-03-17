@@ -10,6 +10,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils.h"
 
 using namespace llvm;
 
@@ -61,6 +62,11 @@ public:
     addPass(createGPUHLSLLoweringPass());
     // Flatten all address spaces to 0 (GPU has flat 32-bit memory)
     addPass(createInferAddressSpacesPass(/*FlatAddrSpace=*/0));
+    // Feed the backend already-structured CFG whenever possible so the late
+    // machine control-flow pass only has to lower, not recover, structure.
+    addPass(createFixIrreduciblePass());
+    addPass(createUnifyLoopExitsPass());
+    addPass(createStructurizeCFGPass(/*SkipUniformRegions=*/false));
     TargetPassConfig::addIRPasses();
   }
 
