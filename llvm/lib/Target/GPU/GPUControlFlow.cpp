@@ -11,8 +11,9 @@
 // Control flow model:
 //   GOTO(flag, JIP):  push disabled lanes, remove from EM, jump if EM=0
 //   JOIN:             pop stack, reactivate parked lanes
-//   WHILE:            push empty entry with is_loop=1 (loop init)
-//   BREAK(flag, tgt): accumulate into nearest loop entry, jump if EM=0
+//   WHILE:            push empty loop frame
+//   BREAK(flag, d, t): accumulate into compiler-selected frame depth d,
+//                      jump if EM=0
 //   JUMP(tgt):        unconditional branch (loop back-edge)
 //
 // Algorithm:
@@ -233,10 +234,12 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
       }
     }
 
-    // BREAK: accumulate exiting lanes into loop's stack entry.
+    // BREAK: depth and offset are patched later once final GOTO/WHILE nesting
+    // is known after flattening.
     BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
         .addReg(flagReg(Info.FReg))
         .addImm(BreakPred)
+        .addImm(0)   // depth placeholder
         .addImm(0);  // offset placeholder
 
     // Update CFG
@@ -311,10 +314,11 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
           MI->eraseFromParent();
       }
 
-      // BREAK for exiting lanes
+      // BREAK for exiting lanes. Depth/offset are patched later.
       BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
           .addReg(flagReg(LatchBI.FReg))
           .addImm(BreakPred)
+          .addImm(0)   // depth placeholder
           .addImm(0);  // offset placeholder
 
       // JUMP back to loop body (instruction after WHILE)
