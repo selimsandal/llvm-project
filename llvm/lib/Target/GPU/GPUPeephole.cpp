@@ -164,6 +164,26 @@ bool GPUPeephole::formFMA(MachineBasicBlock &MBB) {
       Register MulSrc0 = MulMI->getOperand(1).getReg();
       Register MulSrc1 = MulMI->getOperand(2).getReg();
 
+      // Check that MulSrc0 and MulSrc1 are not redefined between FMUL and
+      // FADD. The FMA will be placed where FADD is, so it reads MulSrc0/1
+      // at that point — any intervening def would clobber the value.
+      {
+        bool Clobbered = false;
+        for (auto It = std::next(MachineBasicBlock::iterator(MulMI));
+             &*It != &MI; ++It) {
+          for (const MachineOperand &MO : It->operands()) {
+            if (MO.isReg() && MO.isDef() &&
+                (MO.getReg() == MulSrc0 || MO.getReg() == MulSrc1)) {
+              Clobbered = true;
+              break;
+            }
+          }
+          if (Clobbered) break;
+        }
+        if (Clobbered)
+          continue;
+      }
+
       const TargetInstrInfo &TII =
           *MBB.getParent()->getSubtarget().getInstrInfo();
 

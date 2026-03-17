@@ -866,6 +866,7 @@ bool GPUHLSLLowering::runOnModule(Module &M) {
   Changed |= lowerWaveIntrinsics(M);
   Changed |= lowerMathIntrinsics(M);
   Changed |= stripHLSLMetadata(M);
+
   return Changed;
 }
 
