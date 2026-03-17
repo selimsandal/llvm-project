@@ -219,6 +219,20 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
 
     removeBranchPseudos(*BB);
 
+    // Clone exit-block instructions before BREAK. The exit block may
+    // contain computations (e.g., sky color) that must execute before
+    // BREAK freezes register values. Only clone when the exit block has
+    // a single predecessor (this block) — shared exit blocks (like the
+    // accumulation block) must NOT be cloned.
+    if (ExitBB->pred_size() == 1) {
+      for (auto &MI : *ExitBB) {
+        if (MI.isTerminator() || MI.isDebugInstr())
+          continue;
+        MachineInstr *Clone = BB->getParent()->CloneMachineInstr(&MI);
+        BB->insert(BB->end(), Clone);
+      }
+    }
+
     // BREAK: accumulate exiting lanes into loop's stack entry.
     BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
         .addReg(flagReg(Info.FReg))
@@ -248,7 +262,54 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
       bool TargetInLoop = L->contains(LatchBI.BranchTarget);
       unsigned BreakPred = computePredMode(!TargetInLoop, LatchBI.Invert);
 
+      MachineBasicBlock *LatchExitBB =
+          TargetInLoop ? LatchBI.Fallthrough : LatchBI.BranchTarget;
+
       removeBranchPseudos(*Latch);
+
+      // Convert latch-exit block instructions to flag-gated SELs.
+      // The latch CMP set flag_reg. BREAK will take lanes matching BreakPred.
+      // For each MOV/MOVI in the exit block, use SELi so only exiting lanes
+      // get the exit value while continuing lanes keep their current value.
+      // Without this, exit-block instructions run after JOIN and overwrite
+      // ALL lanes including early-break lanes (destroying their values).
+      if (LatchExitBB && LatchExitBB->pred_size() == 1) {
+        bool IsIfNot = (BreakPred == 2);  // PRED_IF_NOT: exiting = flag=0
+        for (auto &MI : *LatchExitBB) {
+          if (MI.isTerminator() || MI.isDebugInstr())
+            continue;
+          unsigned Opc = MI.getOpcode();
+          if (Opc == GPU::MOVI && IsIfNot) {
+            // MOVI rX, val → SELi rX, flag, rX, val
+            // flag=1 (continuing) → rX (keep), flag=0 (exiting) → val
+            Register DstReg = MI.getOperand(0).getReg();
+            int64_t Imm = MI.getOperand(1).getImm();
+            BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SELi))
+                .addReg(DstReg, RegState::Define)
+                .addReg(DstReg)
+                .addImm(Imm)
+                .addImm(LatchBI.FReg);
+          } else if (Opc == GPU::MOV && IsIfNot) {
+            // MOV rX, rY → SEL rX, flag, rX, rY
+            // flag=1 (continuing) → rX (keep), flag=0 (exiting) → rY
+            Register DstReg = MI.getOperand(0).getReg();
+            Register SrcReg = MI.getOperand(1).getReg();
+            BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::SEL))
+                .addReg(DstReg, RegState::Define)
+                .addReg(DstReg)
+                .addReg(SrcReg)
+                .addImm(LatchBI.FReg);
+          }
+          // Skip non-MOV/MOVI instructions (rare in exit blocks)
+        }
+        // Clear exit block so instructions don't run after JOIN
+        SmallVector<MachineInstr *, 8> ToDel;
+        for (auto &MI : *LatchExitBB)
+          if (!MI.isTerminator() && !MI.isDebugInstr())
+            ToDel.push_back(&MI);
+        for (auto *MI : ToDel)
+          MI->eraseFromParent();
+      }
 
       // BREAK for exiting lanes
       BuildMI(*Latch, Latch->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
