@@ -327,14 +327,16 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     opcode = 0x42;
     break;
 
-  // BREAK: accumulate exiting lanes. flag_reg from operand 0, pred from
-  // operand 1 (GPUPredMode), imm32 from operand 2.
+  // BREAK: accumulate exiting lanes into compiler-selected stack entry.
+  // flag_reg from operand 0, pred from operand 1 (GPUPredMode), cond from
+  // operand 2 (relative target depth), imm32 from operand 3.
   case GPU::BREAK_INST:
     opcode = 0x43;
     imm_en = 1;
     flag_reg = getRegEncoding(MI.getOperand(0).getReg());
     pred = MI.getOperand(1).getImm();
-    imm32 = MI.getOperand(2).getImm();
+    cond = MI.getOperand(2).getImm();
+    imm32 = MI.getOperand(3).getImm();
     break;
 
   // JUMP: unconditional branch. imm32 from operand 0.

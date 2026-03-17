@@ -28,6 +28,12 @@ def GPUCondCode : Operand<i32> {
   let PrintMethod = "printCondCodeOperand";
 }
 
+// Relative mask-stack depth for BREAK target selection.
+// 0 = top-of-stack, 1 = one below top, etc.
+def GPUStackDepth : Operand<i32> {
+  let PrintMethod = "printOperand";
+}
+
 //===--------------------------------------------------------------===//
 // SDNode definitions for GPU-specific nodes
 //===--------------------------------------------------------------===//
@@ -443,11 +449,13 @@ def WHILE_INST : GPUInstCF<0x42,
   (outs), (ins),
   "while", []>;
 
-// BREAK: accumulate exiting lanes into loop entry.
-// pred field selects flag polarity. imm32 = target offset.
+// BREAK: accumulate exiting lanes into an explicit stack entry chosen by the
+// compiler. $depth is encoded in the cond field: 0 = top-of-stack, 1 = one
+// below top, etc. pred selects flag polarity. imm32 is the skip target when
+// exec_mask becomes zero, usually the nearest enclosing JOIN.
 def BREAK_INST : GPUInstCF<0x43,
-  (outs), (ins FlagRC:$flag, GPUPredMode:$pred_mode, brtarget:$offset),
-  "break\t$flag, $offset", []> {
+  (outs), (ins FlagRC:$flag, GPUPredMode:$pred_mode, GPUStackDepth:$depth, brtarget:$offset),
+  "break\t$flag, $depth, $offset", []> {
   let imm_en = 1;
 }
 
