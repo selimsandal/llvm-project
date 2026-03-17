@@ -303,23 +303,26 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
 
       removeBranchPseudos(*Latch);
 
-      // Convert latch-exit MOV/MOVI assignments to flag-gated SELs.
-      // These are typically PHI/copy materializations that should apply only
-      // to lanes exiting through the latch. Other instructions in the exit
-      // block (stores, arithmetic, common post-loop work) must remain after
-      // JOIN so all exiting lanes execute them, including lanes that broke
-      // out of the loop earlier.
+      // Convert only the leading latch-exit MOV/MOVI assignments to flag-gated
+      // SELs. These are typically PHI/copy materializations that should apply
+      // only to lanes exiting through the latch. Local temporaries later in the
+      // block must stay in place; hoisting them changes the live ranges seen by
+      // the flattened mask-stack program and can corrupt values after JOIN.
       //
       // The old code cleared the whole exit block, which dropped real work on
-      // mixed exit blocks. The safe behavior is to hoist only convertible
-      // MOV/MOVI instructions and leave everything else in place.
+      // mixed exit blocks. We now preserve the block and only hoist the
+      // contiguous copy prefix at block entry.
       if (LatchExitBB && LatchExitBB->pred_size() == 1) {
         bool ExitOnFlagTrue = (BreakPred == 1);
         SmallVector<MachineInstr *, 8> ToDel;
         for (auto &MI : *LatchExitBB) {
-          if (MI.isTerminator() || MI.isDebugInstr())
+          if (MI.isDebugInstr())
             continue;
+          if (MI.isTerminator())
+            break;
           unsigned Opc = MI.getOpcode();
+          if (Opc != GPU::MOVI && Opc != GPU::MOV)
+            break;
           if (Opc == GPU::MOVI) {
             // MOVI rX, imm → materialize imm in a dead physical register, then
             // select between the exit value and the current destination based
