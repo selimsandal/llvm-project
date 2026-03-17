@@ -185,11 +185,28 @@ SDValue GPUTargetLowering::LowerGlobalAddress(SDValue Op,
   return DAG.getNode(GPUISD::WRAPPER, DL, MVT::i32, Addr);
 }
 
-static unsigned mapCondCode(ISD::CondCode CC, bool &NeedInvert) {
+static unsigned mapCondCode(ISD::CondCode CC, bool &NeedInvert, bool IsFloat) {
   NeedInvert = false;
+
+  // When the DAG combiner converts ordered float CCs (SETOLT etc.) to
+  // integer CCs (SETLT etc.) due to fast-math flags on operands, we must
+  // still use float comparison on hardware. Remap integer CCs to float CCs
+  // when the operands are f32.
+  if (IsFloat) {
+    switch (CC) {
+    case ISD::SETEQ:  return 3;  // FEQ
+    case ISD::SETNE:  NeedInvert = true; return 3;
+    case ISD::SETLT:  return 4;  // FLT
+    case ISD::SETGE:  NeedInvert = true; return 4;
+    case ISD::SETGT:  return 4;  // FLT (with swap)
+    case ISD::SETLE:  NeedInvert = true; return 4;
+    default: break;  // fall through to normal handling
+    }
+  }
+
   switch (CC) {
   default: llvm_unreachable("Unsupported condition code");
-  case ISD::SETUEQ: return 3;  // Use FEQ (fast-math treats unordered as ordered)
+  case ISD::SETUEQ: return 3;
   case ISD::SETUNE: NeedInvert = true; return 3;
   case ISD::SETEQ:  return 0;
   case ISD::SETNE:  NeedInvert = true; return 0;
@@ -232,8 +249,9 @@ SDValue GPUTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
   SDValue RHS = Op.getOperand(1);
   ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(2))->get();
 
+  bool IsFloat = LHS.getValueType() == MVT::f32;
   bool NeedInvert;
-  unsigned HWCond = mapCondCode(CC, NeedInvert);
+  unsigned HWCond = mapCondCode(CC, NeedInvert, IsFloat);
 
   if (needsOperandSwap(CC))
     std::swap(LHS, RHS);
@@ -263,8 +281,9 @@ SDValue GPUTargetLowering::LowerSELECT_CC(SDValue Op,
   SDValue FalseVal = Op.getOperand(3);
   ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(4))->get();
 
+  bool IsFloat = LHS.getValueType() == MVT::f32;
   bool NeedInvert;
-  unsigned HWCond = mapCondCode(CC, NeedInvert);
+  unsigned HWCond = mapCondCode(CC, NeedInvert, IsFloat);
 
   if (needsOperandSwap(CC))
     std::swap(LHS, RHS);
@@ -291,8 +310,9 @@ SDValue GPUTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
   SDValue RHS = Op.getOperand(3);
   SDValue Dest = Op.getOperand(4);
 
+  bool IsFloat = LHS.getValueType() == MVT::f32;
   bool NeedInvert;
-  unsigned HWCond = mapCondCode(CC, NeedInvert);
+  unsigned HWCond = mapCondCode(CC, NeedInvert, IsFloat);
 
   if (needsOperandSwap(CC))
     std::swap(LHS, RHS);

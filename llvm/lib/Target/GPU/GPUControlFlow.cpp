@@ -220,8 +220,6 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
     removeBranchPseudos(*BB);
 
     // BREAK: accumulate exiting lanes into loop's stack entry.
-    // No exit-block cloning needed — BREAK removes lanes from EM, freezing
-    // their register values. JOIN reactivates them with correct per-lane state.
     BuildMI(*BB, BB->end(), DebugLoc(), TII->get(GPU::BREAK_INST))
         .addReg(flagReg(Info.FReg))
         .addImm(BreakPred)
@@ -241,6 +239,7 @@ void GPUControlFlow::processLoop(MachineLoop *L) {
         MI->eraseFromParent();
     }
   }
+
 
   // Handle latch: BREAK (exiting lanes) + JUMP (continuing lanes back to top)
   {
@@ -678,6 +677,32 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
   TII = MF.getSubtarget().getInstrInfo();
   bool Changed = false;
 
+  // Phase 0: Make all fallthroughs explicit with GPU_BR.
+  // LLVM's block placement may put blocks in unexpected order. Without
+  // explicit branches, getBranchInfo derives fallthroughs from layout
+  // order, which can be wrong after block placement reorders blocks.
+  for (auto &MBB : MF) {
+    if (MBB.succ_empty()) continue;
+    // Check if block ends with an explicit terminator for all paths
+    bool HasBR = false, HasBRCOND = false, HasHALT = false;
+    for (auto It = MBB.end(); It != MBB.begin();) {
+      --It;
+      if (It->isDebugInstr()) continue;
+      if (!It->isTerminator()) break;
+      if (It->getOpcode() == GPU::GPU_BR) HasBR = true;
+      if (It->getOpcode() == GPU::GPU_BRCOND) HasBRCOND = true;
+      if (It->getOpcode() == GPU::HALT) HasHALT = true;
+    }
+    if (HasHALT || HasBR) continue;
+    // Block has BRCOND but no explicit fallthrough, or no terminator at all.
+    // Add GPU_BR for the fallthrough successor.
+    MachineBasicBlock *Fallthrough = MBB.getNextNode();
+    if (Fallthrough && MBB.isSuccessor(Fallthrough)) {
+      BuildMI(MBB, MBB.end(), DebugLoc(), TII->get(GPU::GPU_BR))
+          .addMBB(Fallthrough);
+    }
+  }
+
   // Phase 1: Process loops (WHILE/BREAK/JUMP/JOIN)
   MachineLoopInfo &MLI =
       getAnalysis<MachineLoopInfoWrapperPass>().getLI();
@@ -719,7 +744,44 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
     }
   }
 
-  // Phase 5: Merge all MBBs into a single flat block
+  // Phase 5a: Reorder blocks to reverse post-order (RPO).
+  // LLVM's block placement may put loop-internal blocks after the latch.
+  // RPO ensures loop bodies come before loop exits, and all predecessors
+  // come before successors (except back-edges).
+  {
+    SmallVector<MachineBasicBlock *, 32> RPO;
+    SmallPtrSet<MachineBasicBlock *, 32> Visited;
+    SmallVector<MachineBasicBlock *, 32> PostOrder;
+
+    // Iterative post-order DFS
+    SmallVector<std::pair<MachineBasicBlock *, MachineBasicBlock::succ_iterator>, 16> Stack;
+    MachineBasicBlock *Entry = &MF.front();
+    Visited.insert(Entry);
+    Stack.push_back({Entry, Entry->succ_begin()});
+    while (!Stack.empty()) {
+      auto &[BB, It] = Stack.back();
+      if (It == BB->succ_end()) {
+        PostOrder.push_back(BB);
+        Stack.pop_back();
+      } else {
+        MachineBasicBlock *Succ = *It++;
+        if (Visited.insert(Succ).second)
+          Stack.push_back({Succ, Succ->succ_begin()});
+      }
+    }
+    // Reverse for RPO
+    for (auto It = PostOrder.rbegin(); It != PostOrder.rend(); ++It)
+      RPO.push_back(*It);
+    // Add unreachable blocks
+    for (auto &MBB : MF)
+      if (Visited.insert(&MBB).second)
+        RPO.push_back(&MBB);
+    // Reorder MachineFunction
+    for (auto *BB : RPO)
+      MF.splice(MF.end(), BB);
+  }
+
+  // Phase 5b: Merge all MBBs into a single flat block
   Changed |= mergeAllBlocks(MF);
 
   // Phase 6: Ensure HALT at end
