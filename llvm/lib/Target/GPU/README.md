@@ -38,10 +38,10 @@ compiler.
 Use the validation stack in this order:
 
 1. `./Scripts/test-compiler.sh`
-2. Superproject host-side object verification (`Source/Host/tests/compiler_verify.c`)
-3. Superproject ISA simulator (`Source/Host/gpu_sim.c`)
+2. Superproject host-side object verification (`Source/Host/Tests/compiler_verify.c`)
+3. Superproject ISA simulator (`Source/Host/Lib/gpu_sim.c`)
 4. Superproject pathtracer compare harness
-   (`Source/Host/pathtracer/pathtracer_compare.c`)
+   (`Source/Host/PathTracer/pathtracer_compare.c`)
 
 Interpretation:
 
