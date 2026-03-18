@@ -121,10 +121,10 @@ class GPUInstCF<bits<8> op, dag outs, dag ins, string asmstr,
   let opcode = op;
 }
 
-// Compare format: writes flag register
+// Compare format: writes flag register — category 3 (0x60)
 class GPUInstCmp<dag outs, dag ins, string asmstr, list<dag> pattern>
     : GPUInst<outs, ins, asmstr, pattern> {
-  let opcode = 0x30;
+  let opcode = 0x60;
 }
 
 // Pseudo instruction (not emitted, lowered before encoding)
