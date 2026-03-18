@@ -235,19 +235,19 @@ def SELi : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32, i32imm:$fre
 }
 
 // Integer min/max — native single-cycle ALU instructions
-def SMINrr : GPUInstALU<0x16,
+def SMINrr : GPUInstALU<0x10,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "smin\t$dst, $src0, $src1",
   [(set GPR:$dst, (smin GPR:$src0, GPR:$src1))]>;
-def SMAXrr : GPUInstALU<0x17,
+def SMAXrr : GPUInstALU<0x11,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "smax\t$dst, $src0, $src1",
   [(set GPR:$dst, (smax GPR:$src0, GPR:$src1))]>;
-def UMINrr : GPUInstALU<0x18,
+def UMINrr : GPUInstALU<0x12,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "umin\t$dst, $src0, $src1",
   [(set GPR:$dst, (umin GPR:$src0, GPR:$src1))]>;
-def UMAXrr : GPUInstALU<0x19,
+def UMAXrr : GPUInstALU<0x13,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "umax\t$dst, $src0, $src1",
   [(set GPR:$dst, (umax GPR:$src0, GPR:$src1))]>;
@@ -255,32 +255,32 @@ def UMAXrr : GPUInstALU<0x19,
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
 //===--------------------------------------------------------------===//
-// Memory Instructions (0x1_)
+// Memory Instructions — category 1 (0x20-0x3F)
 //===--------------------------------------------------------------===//
 
 let hasSideEffects = 0 in {
 
 let mayLoad = 1, mayStore = 0 in {
-def LDV : GPUInstMem<0x10,
+def LDV : GPUInstMem<0x20,
   (outs GPR:$dst), (ins GPUimm32:$imm32),
   "ldv\t$dst, $imm32", []>;
 
-def LD_SCATTER : GPUInstMem<0x12,
+def LD_SCATTER : GPUInstMem<0x22,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "ld_scatter\t$dst, [$src0 + $imm32]",
   [(set i32:$dst, (load (add i32:$src0, imm:$imm32)))]>;
 
-def LD_SCALAR : GPUInstMem<0x1A,
+def LD_SCALAR : GPUInstMem<0x26,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "ld_scalar\t$dst, [$src0 + $imm32]", []>;
 }
 
 let mayLoad = 0, mayStore = 1 in {
-def STV : GPUInstMem<0x11,
+def STV : GPUInstMem<0x21,
   (outs), (ins GPR:$src0, GPUimm32:$imm32),
   "stv\t$src0, $imm32", []>;
 
-def ST_SCATTER : GPUInstMem<0x13,
+def ST_SCATTER : GPUInstMem<0x23,
   (outs), (ins GPR:$src0, GPR:$src1, GPUimm32:$imm32),
   "st_scatter\t[$src0 + $imm32], $src1",
   [(store i32:$src1, (add i32:$src0, imm:$imm32))]>;
@@ -290,7 +290,7 @@ let mayLoad = 1, mayStore = 1, hasSideEffects = 1 in {
 def ATOMIC : GPUInst<(outs GPR:$dst),
   (ins GPR:$src0, GPR:$src1, GPUimm32:$imm32, i32imm:$atomic_op),
   "atomic\t$dst, [$src0 + $imm32], $src1", []> {
-  let opcode = 0x14;
+  let opcode = 0x24;
   let imm_en = 1;
 }
 
@@ -298,7 +298,7 @@ def ATOMIC : GPUInst<(outs GPR:$dst),
 def ATOMIC_CAS : GPUInst<(outs GPR:$dst),
   (ins GPR:$src0, GPR:$src1, GPR:$src2, GPUimm32:$imm32),
   "atomic_cas\t$dst, [$src0 + $imm32], $src1, $src2", []> {
-  let opcode = 0x14;
+  let opcode = 0x24;
   let imm_en = 1;
   let cond = 9;
 }
@@ -309,7 +309,7 @@ let mayLoad = 0, mayStore = 1, hasSideEffects = 1 in {
 def PIXEL_OUT : GPUInst<(outs),
   (ins GPR:$src0, GPR:$src1, GPR:$src2),
   "pixel_out\t$src0, $src1, $src2", []> {
-  let opcode = 0x15;
+  let opcode = 0x25;
   let dst = 31;
 }
 }
@@ -317,59 +317,60 @@ def PIXEL_OUT : GPUInst<(outs),
 } // hasSideEffects = 0
 
 //===--------------------------------------------------------------===//
-// Float ALU Instructions (0x2_)
+// Float ALU Instructions — category 2 (0x40-0x5F)
+// Lower 4 bits match FPU_OP codes (fpu_op_r <= instr_op[3:0])
 //===--------------------------------------------------------------===//
 
 let hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
 
-def FADD : GPUInstALU<0x20,
+def FADD : GPUInstALU<0x40,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "fadd\t$dst, $src0, $src1",
   [(set GPR:$dst, (fadd GPR:$src0, GPR:$src1))]>;
 
-def FADDi : GPUInstALUImm<0x20,
+def FADDi : GPUInstALUImm<0x40,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "fadd\t$dst, $src0, $imm32", []>;
 
-def FMUL : GPUInstALU<0x21,
+def FMUL : GPUInstALU<0x41,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "fmul\t$dst, $src0, $src1",
   [(set GPR:$dst, (fmul GPR:$src0, GPR:$src1))]>;
 
-def FMULi : GPUInstALUImm<0x21,
+def FMULi : GPUInstALUImm<0x41,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "fmul\t$dst, $src0, $imm32", []>;
 
-def FSUB : GPUInstALU<0x22,
+def FSUB : GPUInstALU<0x42,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "fsub\t$dst, $src0, $src1",
   [(set GPR:$dst, (fsub GPR:$src0, GPR:$src1))]>;
 
-def FSUBi : GPUInstALUImm<0x22,
+def FSUBi : GPUInstALUImm<0x42,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "fsub\t$dst, $src0, $imm32", []>;
 
-def FDIV : GPUInstALU<0x23,
+def FDIV : GPUInstALU<0x43,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "fdiv\t$dst, $src0, $src1",
   [(set GPR:$dst, (fdiv GPR:$src0, GPR:$src1))]>;
 
-def FMIN : GPUInstALU<0x24,
+def FMIN : GPUInstALU<0x44,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "fmin\t$dst, $src0, $src1",
   [(set GPR:$dst, (fminnum GPR:$src0, GPR:$src1))]>;
 
-def FMAX : GPUInstALU<0x25,
+def FMAX : GPUInstALU<0x45,
   (outs GPR:$dst), (ins GPR:$src0, GPR:$src1),
   "fmax\t$dst, $src0, $src1",
   [(set GPR:$dst, (fmaxnum GPR:$src0, GPR:$src1))]>;
 
-def ITOF : GPUInstUnary<0x26,
+def ITOF : GPUInstUnary<0x46,
   (outs GPR:$dst), (ins GPR:$src0),
   "itof\t$dst, $src0",
   [(set GPR:$dst, (sint_to_fp GPR:$src0))]>;
 
-def FTOI : GPUInstUnary<0x27,
+def FTOI : GPUInstUnary<0x47,
   (outs GPR:$dst), (ins GPR:$src0),
   "ftoi\t$dst, $src0",
   [(set GPR:$dst, (fp_to_sint GPR:$src0))]>;
@@ -377,15 +378,15 @@ def FTOI : GPUInstUnary<0x27,
 def FMA : GPUInst<(outs GPR:$dst), (ins GPR:$src0, GPR:$src1, GPR:$src2),
   "fma\t$dst, $src0, $src1, $src2",
   [(set GPR:$dst, (fma GPR:$src0, GPR:$src1, GPR:$src2))]> {
-  let opcode = 0x28;
+  let opcode = 0x48;
 }
 
-def UITOF : GPUInstUnary<0x29,
+def UITOF : GPUInstUnary<0x49,
   (outs GPR:$dst), (ins GPR:$src0),
   "uitof\t$dst, $src0",
   [(set GPR:$dst, (uint_to_fp GPR:$src0))]>;
 
-def FTOU : GPUInstUnary<0x2A,
+def FTOU : GPUInstUnary<0x4A,
   (outs GPR:$dst), (ins GPR:$src0),
   "ftou\t$dst, $src0",
   [(set GPR:$dst, (fp_to_uint GPR:$src0))]>;
@@ -393,7 +394,7 @@ def FTOU : GPUInstUnary<0x2A,
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
 //===--------------------------------------------------------------===//
-// Compare Instructions (0x30)
+// Compare Instructions — category 3 (0x60)
 //===--------------------------------------------------------------===//
 
 let hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
@@ -408,7 +409,7 @@ def CMPrr : GPUInstCmp<
 def CMPri : GPUInst<
   (outs), (ins GPR:$src0, GPUimm32:$imm32, i32imm:$cc, i32imm:$freg),
   "cmp\t$src0, $imm32", []> {
-  let opcode = 0x30;
+  let opcode = 0x60;
   let imm_en = 1;
   let Defs = [F0];
   let hasSideEffects = 0;
@@ -419,7 +420,7 @@ def CMPri : GPUInst<
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
 //===--------------------------------------------------------------===//
-// Control Flow Instructions (0x4_)
+// Control Flow Instructions — category 4 (0x80-0x9F)
 //===--------------------------------------------------------------===//
 
 // Predication mode operand for GOTO/BREAK (maps to pred field in encoding)
@@ -433,19 +434,19 @@ let hasSideEffects = 1 in {
 // GOTO: flag-conditional diverge. Pushes exec_mask, masks lanes by flag.
 // pred field selects polarity (PRED_IF=1 or PRED_IF_NOT=2).
 // imm32 = JIP offset (skip distance when all lanes fail).
-def GOTO_INST : GPUInstCF<0x40,
+def GOTO_INST : GPUInstCF<0x80,
   (outs), (ins FlagRC:$flag, GPUPredMode:$pred_mode, brtarget:$offset),
   "goto\t$flag, $offset", []> {
   let imm_en = 1;
 }
 
 // JOIN: reconverge (pop mask stack). No operands.
-def JOIN_INST : GPUInstCF<0x41,
+def JOIN_INST : GPUInstCF<0x81,
   (outs), (ins),
   "join", []>;
 
 // WHILE: loop init (push empty mask). No operands.
-def WHILE_INST : GPUInstCF<0x42,
+def WHILE_INST : GPUInstCF<0x82,
   (outs), (ins),
   "while", []>;
 
@@ -453,14 +454,14 @@ def WHILE_INST : GPUInstCF<0x42,
 // compiler. $depth is encoded in the cond field: 0 = top-of-stack, 1 = one
 // below top, etc. pred selects flag polarity. imm32 is the skip target when
 // exec_mask becomes zero, usually the nearest enclosing JOIN.
-def BREAK_INST : GPUInstCF<0x43,
+def BREAK_INST : GPUInstCF<0x83,
   (outs), (ins FlagRC:$flag, GPUPredMode:$pred_mode, GPUStackDepth:$depth, brtarget:$offset),
   "break\t$flag, $depth, $offset", []> {
   let imm_en = 1;
 }
 
 // JUMP: unconditional branch. imm32 = target offset.
-def JUMP_INST : GPUInstCF<0x44,
+def JUMP_INST : GPUInstCF<0x84,
   (outs), (ins brtarget:$offset),
   "jump\t$offset", []> {
   let imm_en = 1;
@@ -469,7 +470,7 @@ def JUMP_INST : GPUInstCF<0x44,
 let isTerminator = 1, isReturn = 1, isBarrier = 1 in {
 def HALT : GPUInst<(outs), (ins), "halt",
   [(GPUhalt)]> {
-  let opcode = 0xFF;
+  let opcode = 0x85;
 }
 }
 
