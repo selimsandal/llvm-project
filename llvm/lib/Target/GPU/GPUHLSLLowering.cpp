@@ -12,13 +12,16 @@
 //     → llc -march=gpu -filetype=obj
 //     → GPU ELF object
 //
-// Intrinsic Mapping:
-//   SV_DispatchThreadID    → r0 (full thread ID = engine*8 + lane)
-//   SV_GroupID             → r1 (from descriptor)
+// Current intrinsic mapping in the shipped software ABI:
+//   SV_DispatchThreadID    → r0 (physical thread ID)
+//   SV_GroupID             → r1 (older descriptor convention)
 //   SV_GroupThreadID       → r0 & 7 (lane within engine)
 //   SV_GroupIndex          → r0 & 7
 //   WaveGetLaneIndex()     → r0 & 7
 //   WaveGetLaneCount()     → 8 (constant)
+//
+// Hardware now also exposes logical workgroup IDs through hidden launch
+// context + I_GETSR, but this pass has not migrated to that ABI yet.
 //
 // Resource Binding → GPU Register Mapping:
 //   register(u0/t0/b0)    → r1 (descriptor init_r1)
@@ -220,7 +223,7 @@ bool GPUHLSLLowering::lowerThreadIDIntrinsics(Module &M) {
 
       switch (Kind) {
       case DX_THREAD_ID: {
-        // SV_DispatchThreadID.x → r0 (global thread ID)
+        // Current software ABI: SV_DispatchThreadID.x → r0 (physical thread ID)
         // For dim > 0, return 0 (1D dispatch only)
         if (auto *DimC = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
           if (DimC->isZero())
@@ -233,7 +236,7 @@ bool GPUHLSLLowering::lowerThreadIDIntrinsics(Module &M) {
         break;
       }
       case DX_GROUP_ID: {
-        // SV_GroupID.x → r1 (from descriptor init_r1)
+        // Current software ABI: SV_GroupID.x → r1
         if (auto *DimC = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
           if (DimC->isZero())
             Result = createRegRead(Builder, M, "r1");
@@ -247,7 +250,7 @@ bool GPUHLSLLowering::lowerThreadIDIntrinsics(Module &M) {
       case DX_THREAD_ID_IN_GROUP:
       case DX_FLATTENED_THREAD_ID:
       case DX_WAVE_GETLANEINDEX: {
-        // Lane index within engine → r0 & 7
+        // Current software ABI: lane index within engine → r0 & 7
         Value *R0 = createRegRead(Builder, M, "r0");
         Result = Builder.CreateAnd(R0, Builder.getInt32(7), "lane_id");
         break;
