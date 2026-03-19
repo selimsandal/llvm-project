@@ -39,16 +39,18 @@ Currently supported source-level pieces on the intended path:
 
 - OpenCL `barrier()` / `mem_fence()` for the supported subset
 - optimized OpenCL `__local` kernel arguments
-- optimized OpenCL `atomic_add(__local *)`
+- optimized OpenCL local atomic builtins on the currently verified subset:
+  `atomic_add`, `atomic_xchg`, `atomic_or`, `atomic_and`, `atomic_xor`,
+  `atomic_min`, `atomic_max`, `atomic_cmpxchg`
 - HLSL `groupshared` globals plus
   `GroupMemoryBarrierWithGroupSync()` for the current compute subset
+- HLSL `groupshared` `InterlockedAdd/And/Or/Xor/Min/Max/Exchange/
+  CompareExchange` for the current compute subset
 
 Still incomplete:
 
-- broader source-level OpenCL local/shared-memory atomic coverage
-- source-level HLSL local/shared-memory atomics
-- the unoptimized OpenCL `-O0` local-argument `FrameIndex` selector gap
 - full simulator-sync parity for these higher-level surfaces
+- any source-level atomic variants outside the currently verified subset
 
 ## Current Review Notes
 
@@ -174,7 +176,8 @@ coverage, not just higher-level host tests.
 - `llvm/test/CodeGen/GPU/opencl-local-arg.ll`
   - proves optimized OpenCL `__local` kernel arguments reach local-memory ops
 - `llvm/test/CodeGen/GPU/opencl-local-arg-o0.ll`
-  - exists specifically to track the current unoptimized `-O0` wrapper gap
+  - exists specifically to keep the unoptimized `-O0` local-argument wrapper
+    path from regressing again
 - `llvm/test/CodeGen/GPU/opencl-local-atomic-builtins.ll`
   - proves source-level OpenCL local atomic builtins lower to local atomics
 
