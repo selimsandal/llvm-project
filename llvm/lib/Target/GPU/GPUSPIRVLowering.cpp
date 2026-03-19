@@ -13,8 +13,12 @@
 //   get_local_id(0)   → r0 & 7 (lane within engine)
 //   get_group_id(0)   → r1 (older descriptor convention)
 //
-// Hardware now also exposes logical workgroup IDs through hidden launch
-// context + I_GETSR, but this pass has not migrated to that ABI yet.
+// Hardware now also exposes raw workgroup state through hidden launch
+// context + I_GETSR:
+//   group_id, local_size, num_groups, subgroup-local base, local_id
+// The intended migration is to derive higher-level builtins like global_id
+// in the compiler from group_id * local_size + local_id, but this pass has
+// not migrated to that ABI yet.
 //   mad(a,b,c)        → llvm.fma.f32
 //   min/max           → llvm.minnum/maxnum.f32
 //
