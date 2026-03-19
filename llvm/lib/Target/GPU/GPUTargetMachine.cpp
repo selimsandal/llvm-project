@@ -7,8 +7,14 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
+#include "llvm/Support/Alignment.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils.h"
 
@@ -48,6 +54,62 @@ GPUTargetMachine::GPUTargetMachine(const Target &T, const Triple &TT,
 }
 
 namespace {
+class GPULocalMemoryGlobalsPass : public ModulePass {
+public:
+  static char ID;
+  GPULocalMemoryGlobalsPass() : ModulePass(ID) {}
+
+  bool runOnModule(Module &M) override {
+    static constexpr uint64_t GPULocalMemBytes = 4096ull * 4ull;
+    const DataLayout &DL = M.getDataLayout();
+    SmallVector<GlobalVariable *, 8> LocalGlobals;
+    uint64_t NextOffset = 0;
+    bool Changed = false;
+
+    for (GlobalVariable &GV : M.globals()) {
+      if (GV.getAddressSpace() != 3)
+        continue;
+      LocalGlobals.push_back(&GV);
+    }
+
+    for (GlobalVariable *GV : LocalGlobals) {
+      if (GV->hasInitializer() && !GV->getInitializer()->isNullValue() &&
+          !isa<UndefValue>(GV->getInitializer())) {
+        report_fatal_error("GPU local addrspace globals only support zero/undef "
+                           "initializers");
+      }
+
+      Align A = GV->getAlign().value_or(DL.getABITypeAlign(GV->getValueType()));
+      NextOffset = alignTo(NextOffset, A);
+      uint64_t Size = DL.getTypeAllocSize(GV->getValueType());
+      if (NextOffset + Size > GPULocalMemBytes) {
+        report_fatal_error("GPU local addrspace globals exceed per-workgroup "
+                           "local memory capacity");
+      }
+
+      Constant *Offset =
+          ConstantInt::get(Type::getInt32Ty(M.getContext()), NextOffset);
+      Constant *Ptr = ConstantExpr::getIntToPtr(Offset, GV->getType());
+      GV->replaceAllUsesWith(Ptr);
+      NextOffset += Size;
+      Changed = true;
+    }
+
+    for (GlobalVariable *GV : LocalGlobals) {
+      if (GV->use_empty())
+        GV->eraseFromParent();
+    }
+
+    return Changed;
+  }
+};
+
+char GPULocalMemoryGlobalsPass::ID = 0;
+
+static ModulePass *createGPULocalMemoryGlobalsPass() {
+  return new GPULocalMemoryGlobalsPass();
+}
+
 class GPUPassConfig : public TargetPassConfig {
 public:
   GPUPassConfig(GPUTargetMachine &TM, PassManagerBase *PM)
@@ -60,8 +122,9 @@ public:
   void addIRPasses() override {
     addPass(createGPUSPIRVLoweringPass());
     addPass(createGPUHLSLLoweringPass());
-    // Flatten all address spaces to 0 (GPU has flat 32-bit memory)
-    addPass(createInferAddressSpacesPass(/*FlatAddrSpace=*/0));
+    addPass(createGPULocalMemoryGlobalsPass());
+    // Keep addrspace(3) distinct so local/shared memory reaches target lowering
+    // as real local-memory operations instead of being flattened to global.
     // Feed the backend already-structured CFG whenever possible so the late
     // machine control-flow pass only has to lower, not recover, structure.
     addPass(createFixIrreduciblePass());

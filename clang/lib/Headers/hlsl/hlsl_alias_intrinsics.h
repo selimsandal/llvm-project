@@ -218,5 +218,58 @@ _HLSL_BUILTIN_ALIAS(__builtin_hlsl_select)
 __detail::enable_if_t<__detail::is_arithmetic<T>::Value, vector<T, 4>> select(
     vector<bool, 4>, T, T);
 
+//===----------------------------------------------------------------------===//
+// Interlocked* groupshared atomics
+//===----------------------------------------------------------------------===//
+
+/// \brief Performs an atomic add on a groupshared scalar, optionally
+/// returning the previous value through \a original.
+void InterlockedAdd(groupshared int dest, int value);
+void InterlockedAdd(groupshared int dest, int value, out int original);
+void InterlockedAdd(groupshared uint dest, uint value);
+void InterlockedAdd(groupshared uint dest, uint value, out uint original);
+
+/// \brief Performs an atomic bitwise and on a groupshared scalar.
+void InterlockedAnd(groupshared int dest, int value);
+void InterlockedAnd(groupshared int dest, int value, out int original);
+void InterlockedAnd(groupshared uint dest, uint value);
+void InterlockedAnd(groupshared uint dest, uint value, out uint original);
+
+/// \brief Performs an atomic compare-exchange on a groupshared scalar.
+void InterlockedCompareExchange(groupshared int dest, int compare_value,
+                                int value, out int original);
+void InterlockedCompareExchange(groupshared uint dest, uint compare_value,
+                                uint value, out uint original);
+
+/// \brief Performs an atomic exchange on a groupshared scalar.
+void InterlockedExchange(groupshared int dest, int value);
+void InterlockedExchange(groupshared int dest, int value, out int original);
+void InterlockedExchange(groupshared uint dest, uint value);
+void InterlockedExchange(groupshared uint dest, uint value, out uint original);
+
+/// \brief Performs an atomic max on a groupshared scalar.
+void InterlockedMax(groupshared int dest, int value);
+void InterlockedMax(groupshared int dest, int value, out int original);
+void InterlockedMax(groupshared uint dest, uint value);
+void InterlockedMax(groupshared uint dest, uint value, out uint original);
+
+/// \brief Performs an atomic min on a groupshared scalar.
+void InterlockedMin(groupshared int dest, int value);
+void InterlockedMin(groupshared int dest, int value, out int original);
+void InterlockedMin(groupshared uint dest, uint value);
+void InterlockedMin(groupshared uint dest, uint value, out uint original);
+
+/// \brief Performs an atomic bitwise or on a groupshared scalar.
+void InterlockedOr(groupshared int dest, int value);
+void InterlockedOr(groupshared int dest, int value, out int original);
+void InterlockedOr(groupshared uint dest, uint value);
+void InterlockedOr(groupshared uint dest, uint value, out uint original);
+
+/// \brief Performs an atomic bitwise xor on a groupshared scalar.
+void InterlockedXor(groupshared int dest, int value);
+void InterlockedXor(groupshared int dest, int value, out int original);
+void InterlockedXor(groupshared uint dest, uint value);
+void InterlockedXor(groupshared uint dest, uint value, out uint original);
+
 } // namespace hlsl
 #endif //_HLSL_HLSL_ALIAS_INTRINSICS_H_

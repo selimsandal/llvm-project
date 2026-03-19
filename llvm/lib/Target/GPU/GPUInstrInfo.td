@@ -252,6 +252,11 @@ def UMAXrr : GPUInstALU<0x13,
   "umax\t$dst, $src0, $src1",
   [(set GPR:$dst, (umax GPR:$src0, GPR:$src1))]>;
 
+def GETSR : GPUInst<(outs GPR:$dst), (ins i32imm:$sreg),
+  "getsr\t$dst, $sreg", []> {
+  let opcode = 0x14;
+}
+
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
 //===--------------------------------------------------------------===//
@@ -270,6 +275,10 @@ def LD_SCATTER : GPUInstMem<0x22,
   "ld_scatter\t$dst, [$src0 + $imm32]",
   [(set i32:$dst, (load (add i32:$src0, imm:$imm32)))]>;
 
+def LD_LOCAL : GPUInstMem<0x27,
+  (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
+  "ld_local\t$dst, [$src0 + $imm32]", []>;
+
 def LD_SCALAR : GPUInstMem<0x26,
   (outs GPR:$dst), (ins GPR:$src0, GPUimm32:$imm32),
   "ld_scalar\t$dst, [$src0 + $imm32]", []>;
@@ -284,6 +293,10 @@ def ST_SCATTER : GPUInstMem<0x23,
   (outs), (ins GPR:$src0, GPR:$src1, GPUimm32:$imm32),
   "st_scatter\t[$src0 + $imm32], $src1",
   [(store i32:$src1, (add i32:$src0, imm:$imm32))]>;
+
+def ST_LOCAL : GPUInstMem<0x28,
+  (outs), (ins GPR:$src0, GPR:$src1, GPUimm32:$imm32),
+  "st_local\t[$src0 + $imm32], $src1", []>;
 }
 
 let mayLoad = 1, mayStore = 1, hasSideEffects = 1 in {
@@ -299,6 +312,21 @@ def ATOMIC_CAS : GPUInst<(outs GPR:$dst),
   (ins GPR:$src0, GPR:$src1, GPR:$src2, GPUimm32:$imm32),
   "atomic_cas\t$dst, [$src0 + $imm32], $src1, $src2", []> {
   let opcode = 0x24;
+  let imm_en = 1;
+  let cond = 9;
+}
+
+def ATOMIC_LOCAL : GPUInst<(outs GPR:$dst),
+  (ins GPR:$src0, GPR:$src1, GPUimm32:$imm32, i32imm:$atomic_op),
+  "atomic_local\t$dst, [$src0 + $imm32], $src1", []> {
+  let opcode = 0x29;
+  let imm_en = 1;
+}
+
+def ATOMIC_LOCAL_CAS : GPUInst<(outs GPR:$dst),
+  (ins GPR:$src0, GPR:$src1, GPR:$src2, GPUimm32:$imm32),
+  "atomic_local_cas\t$dst, [$src0 + $imm32], $src1, $src2", []> {
+  let opcode = 0x29;
   let imm_en = 1;
   let cond = 9;
 }
@@ -472,6 +500,26 @@ def HALT : GPUInst<(outs), (ins), "halt",
   [(GPUhalt)]> {
   let opcode = 0x85;
 }
+
+// Same encoding as HALT, but carries an explicit return-register use so the
+// copy into the ABI return register is not dead-code-eliminated.
+def HALT_RET : GPUInst<(outs), (ins GPR:$ret), "halt", []> {
+  let opcode = 0x85;
+}
+}
+
+def BARRIER : GPUInst<(outs), (ins i32imm:$mode), "barrier\t$mode", []> {
+  let opcode = 0x86;
+  let hasSideEffects = 1;
+  let mayLoad = 0;
+  let mayStore = 0;
+}
+
+def MEM_FENCE : GPUInst<(outs), (ins i32imm:$mode), "mem_fence\t$mode", []> {
+  let opcode = 0x87;
+  let hasSideEffects = 1;
+  let mayLoad = 0;
+  let mayStore = 0;
 }
 
 } // hasSideEffects = 1

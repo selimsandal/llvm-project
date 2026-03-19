@@ -14,6 +14,44 @@ using namespace llvm;
 
 namespace {
 
+static bool matchBasePlusOffset(SDValue Addr, SDValue &Base, int32_t &Offset) {
+  Base = Addr;
+  Offset = 0;
+
+  if (Addr.getOpcode() != ISD::ADD)
+    return true;
+
+  SDValue LHS = Addr.getOperand(0);
+  SDValue RHS = Addr.getOperand(1);
+  if (auto *C = dyn_cast<ConstantSDNode>(RHS)) {
+    Base = LHS;
+    Offset = (int32_t)C->getSExtValue();
+    return true;
+  }
+  if (auto *C = dyn_cast<ConstantSDNode>(LHS)) {
+    Base = RHS;
+    Offset = (int32_t)C->getSExtValue();
+    return true;
+  }
+  // Local-memory ops can still use a fully computed address register as the
+  // base with an immediate offset of 0.
+  return true;
+}
+
+static bool materializeConstantBase(SelectionDAG *DAG, SDLoc DL,
+                                    SDValue &Base, int32_t &Offset) {
+  auto *C = dyn_cast<ConstantSDNode>(Base);
+  if (!C)
+    return false;
+
+  int32_t BaseImm = (int32_t)C->getSExtValue();
+  Base = SDValue(DAG->getMachineNode(
+      GPU::MOVI, DL, MVT::i32,
+      DAG->getTargetConstant((uint32_t)BaseImm, DL, MVT::i32)), 0);
+  Offset = 0;
+  return true;
+}
+
 class GPUDAGToDAGISel : public SelectionDAGISel {
   const GPUSubtarget *Subtarget;
 
@@ -64,6 +102,57 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
   default:
     break;
 
+  case ISD::LOAD: {
+    auto *LD = cast<LoadSDNode>(N);
+    SDLoc DL(N);
+    SDValue Base;
+    int32_t Offset;
+
+    if (LD->getAddressSpace() != 3 ||
+        LD->isIndexed() ||
+        LD->getExtensionType() != ISD::NON_EXTLOAD ||
+        (N->getValueType(0) != MVT::i32 && N->getValueType(0) != MVT::f32) ||
+        !matchBasePlusOffset(LD->getBasePtr(), Base, Offset))
+      break;
+
+    materializeConstantBase(CurDAG, DL, Base, Offset);
+
+    SDNode *LocalLoad = CurDAG->getMachineNode(
+        GPU::LD_LOCAL, DL, N->getValueType(0), MVT::Other,
+        {Base, CurDAG->getTargetConstant(Offset, DL, MVT::i32),
+         LD->getChain()});
+    ReplaceUses(SDValue(N, 0), SDValue(LocalLoad, 0));
+    ReplaceUses(SDValue(N, 1), SDValue(LocalLoad, 1));
+    CurDAG->RemoveDeadNode(N);
+    return;
+  }
+
+  case ISD::STORE: {
+    auto *ST = cast<StoreSDNode>(N);
+    SDLoc DL(N);
+    SDValue Base;
+    int32_t Offset;
+
+    if (ST->getAddressSpace() != 3 ||
+        ST->isIndexed() ||
+        !matchBasePlusOffset(ST->getBasePtr(), Base, Offset))
+      break;
+
+    materializeConstantBase(CurDAG, DL, Base, Offset);
+
+    SDValue StoreVal = ST->getValue();
+    EVT StoreVT = StoreVal.getValueType();
+    if (StoreVT != MVT::i32 && StoreVT != MVT::f32)
+      break;
+
+    SDNode *LocalStore = CurDAG->getMachineNode(
+        GPU::ST_LOCAL, DL, MVT::Other,
+        {Base, StoreVal, CurDAG->getTargetConstant(Offset, DL, MVT::i32),
+         ST->getChain()});
+    ReplaceNode(N, LocalStore);
+    return;
+  }
+
   case GPUISD::CMP: {
     SDLoc DL(N);
     unsigned HWCond = N->getConstantOperandVal(0);
@@ -99,8 +188,13 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
 
   case GPUISD::RETURN: {
     SDLoc DL(N);
-    SDNode *Halt = CurDAG->getMachineNode(GPU::HALT, DL, MVT::Other,
-                                          N->getOperand(0));
+    SDNode *Halt = nullptr;
+    if (N->getNumOperands() > 1)
+      Halt = CurDAG->getMachineNode(GPU::HALT_RET, DL, MVT::Other,
+                                    {N->getOperand(1), N->getOperand(0)});
+    else
+      Halt = CurDAG->getMachineNode(GPU::HALT, DL, MVT::Other,
+                                    N->getOperand(0));
     ReplaceNode(N, Halt);
     return;
   }
@@ -112,6 +206,16 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
         GPU::MOVI, DL, MVT::i32,
         CurDAG->getTargetConstant(Val, DL, MVT::i32));
     ReplaceNode(N, MoviNode);
+    return;
+  }
+
+  case GPUISD::GETSR: {
+    SDLoc DL(N);
+    uint32_t SReg = N->getConstantOperandVal(0);
+    SDNode *GetSRNode = CurDAG->getMachineNode(
+        GPU::GETSR, DL, N->getValueType(0),
+        CurDAG->getTargetConstant(SReg, DL, MVT::i32));
+    ReplaceNode(N, GetSRNode);
     return;
   }
 
@@ -136,6 +240,7 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     auto *AN = cast<AtomicSDNode>(N);
     SDValue Addr = AN->getBasePtr();
     SDValue Val = AN->getVal();
+    bool IsLocal = cast<MemSDNode>(N)->getAddressSpace() == 3;
 
     unsigned AtomicOp;
     switch (Opcode) {
@@ -158,7 +263,8 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
       AN->getChain()
     };
     SDNode *AtomicNode = CurDAG->getMachineNode(
-        GPU::ATOMIC, DL, MVT::i32, MVT::Other, Ops);
+        IsLocal ? GPU::ATOMIC_LOCAL : GPU::ATOMIC, DL, MVT::i32, MVT::Other,
+        Ops);
     ReplaceNode(N, AtomicNode);
     return;
   }
@@ -169,6 +275,7 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     SDValue Addr = AN->getBasePtr();
     SDValue CmpVal = AN->getOperand(2);
     SDValue SwapVal = AN->getOperand(3);
+    bool IsLocal = cast<MemSDNode>(N)->getAddressSpace() == 3;
 
     SDValue Ops[] = {
       Addr, CmpVal, SwapVal,
@@ -176,7 +283,8 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
       AN->getChain()
     };
     SDNode *CASNode = CurDAG->getMachineNode(
-        GPU::ATOMIC_CAS, DL, MVT::i32, MVT::Other, Ops);
+        IsLocal ? GPU::ATOMIC_LOCAL_CAS : GPU::ATOMIC_CAS, DL, MVT::i32,
+        MVT::Other, Ops);
     ReplaceNode(N, CASNode);
     return;
   }
@@ -187,6 +295,15 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     unsigned ReduceOp;
     switch (IntrID) {
     default: break; // Fall through to SelectCode
+    case Intrinsic::gpu_getsr: {
+      SDValue SReg = N->getOperand(1);
+      SDNode *GetSRNode = CurDAG->getMachineNode(
+          GPU::GETSR, DL, N->getValueType(0),
+          CurDAG->getTargetConstant(cast<ConstantSDNode>(SReg)->getZExtValue(),
+                                    DL, MVT::i32));
+      ReplaceNode(N, GetSRNode);
+      return;
+    }
     case Intrinsic::gpu_reduce_add:  ReduceOp = 0; goto do_reduce;
     case Intrinsic::gpu_reduce_and:  ReduceOp = 1; goto do_reduce;
     case Intrinsic::gpu_reduce_or:   ReduceOp = 2; goto do_reduce;
@@ -208,6 +325,34 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     }
     }
     break; // Fall through to SelectCode for non-GPU intrinsics
+  }
+
+  case ISD::INTRINSIC_VOID: {
+    SDLoc DL(N);
+    unsigned IntrID = N->getConstantOperandVal(1);
+    switch (IntrID) {
+    default:
+      break;
+    case Intrinsic::gpu_workgroup_sync: {
+      SDValue Mode = N->getOperand(2);
+      SDValue Ops[] = {
+          CurDAG->getTargetConstant(cast<ConstantSDNode>(Mode)->getZExtValue(),
+                                    DL, MVT::i32),
+          N->getOperand(0)};
+      CurDAG->SelectNodeTo(N, GPU::BARRIER, MVT::Other, Ops);
+      return;
+    }
+    case Intrinsic::gpu_mem_fence: {
+      SDValue Mode = N->getOperand(2);
+      SDValue Ops[] = {
+          CurDAG->getTargetConstant(cast<ConstantSDNode>(Mode)->getZExtValue(),
+                                    DL, MVT::i32),
+          N->getOperand(0)};
+      CurDAG->SelectNodeTo(N, GPU::MEM_FENCE, MVT::Other, Ops);
+      return;
+    }
+    }
+    break;
   }
 
   case GPUISD::REDUCE: {

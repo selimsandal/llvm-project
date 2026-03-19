@@ -125,6 +125,12 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
   case GPU::SMAXrr: opcode = 0x11; goto alu_rrr;
   case GPU::UMINrr: opcode = 0x12; goto alu_rrr;
   case GPU::UMAXrr: opcode = 0x13; goto alu_rrr;
+  case GPU::GETSR:
+    opcode = 0x14;
+    imm_en = 1;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    imm32 = MI.getOperand(1).getImm();
+    break;
   case GPU::FADD: opcode = 0x40; goto float_rrr;
   case GPU::FMUL: opcode = 0x41; goto float_rrr;
   case GPU::FSUB: opcode = 0x42; goto float_rrr;
@@ -247,9 +253,27 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     imm32 = MI.getOperand(2).getImm();
     break;
 
+  // Memory: LD_LOCAL dst, src0, offset
+  case GPU::LD_LOCAL:
+    opcode = 0x27;
+    imm_en = 1;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    imm32 = MI.getOperand(2).getImm();
+    break;
+
   // Memory: ST_SCATTER src0, src1, offset
   case GPU::ST_SCATTER:
     opcode = 0x23;
+    imm_en = 1;
+    src0 = getRegEncoding(MI.getOperand(0).getReg());
+    src1 = getRegEncoding(MI.getOperand(1).getReg());
+    imm32 = MI.getOperand(2).getImm();
+    break;
+
+  // Memory: ST_LOCAL src0, src1, offset
+  case GPU::ST_LOCAL:
+    opcode = 0x28;
     imm_en = 1;
     src0 = getRegEncoding(MI.getOperand(0).getReg());
     src1 = getRegEncoding(MI.getOperand(1).getReg());
@@ -267,9 +291,32 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     cond = MI.getOperand(4).getImm();
     break;
 
+  // Memory: ATOMIC_LOCAL dst, src0, src1, offset, atomic_op
+  case GPU::ATOMIC_LOCAL:
+    opcode = 0x29;
+    imm_en = 1;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    src1 = getRegEncoding(MI.getOperand(2).getReg());
+    imm32 = MI.getOperand(3).getImm();
+    cond = MI.getOperand(4).getImm();
+    break;
+
   // Memory: ATOMIC_CAS dst, src0(addr), src1(cmp), src2(swap), imm32(offset)
   case GPU::ATOMIC_CAS:
     opcode = 0x24;
+    imm_en = 1;
+    cond = 9;
+    dst = getRegEncoding(MI.getOperand(0).getReg());
+    src0 = getRegEncoding(MI.getOperand(1).getReg());
+    src1 = getRegEncoding(MI.getOperand(2).getReg());
+    src2 = getRegEncoding(MI.getOperand(3).getReg());
+    imm32 = MI.getOperand(4).getImm();
+    break;
+
+  // Memory: ATOMIC_LOCAL_CAS dst, src0(addr), src1(cmp), src2(swap), imm32(offset)
+  case GPU::ATOMIC_LOCAL_CAS:
+    opcode = 0x29;
     imm_en = 1;
     cond = 9;
     dst = getRegEncoding(MI.getOperand(0).getReg());
@@ -347,7 +394,18 @@ void GPUMCCodeEmitter::encode128(const MCInst &MI, uint32_t W[4]) const {
     break;
 
   case GPU::HALT:
+  case GPU::HALT_RET:
     opcode = 0x85;
+    break;
+
+  case GPU::BARRIER:
+    opcode = 0x86;
+    cond = MI.getOperand(0).getImm();
+    break;
+
+  case GPU::MEM_FENCE:
+    opcode = 0x87;
+    cond = MI.getOperand(0).getImm();
     break;
   }
 
