@@ -20,8 +20,12 @@
 //   WaveGetLaneIndex()     → r0 & 7
 //   WaveGetLaneCount()     → 8 (constant)
 //
-// Hardware now also exposes logical workgroup IDs through hidden launch
-// context + I_GETSR, but this pass has not migrated to that ABI yet.
+// Hardware now also exposes raw workgroup state through hidden launch
+// context + I_GETSR:
+//   group_id, local_size, num_groups, subgroup-local base, local_id
+// The intended migration is to derive higher-level HLSL system values like
+// DispatchThreadID from group_id * local_size + local_id in the compiler,
+// but this pass has not migrated to that ABI yet.
 //
 // Resource Binding → GPU Register Mapping:
 //   register(u0/t0/b0)    → r1 (descriptor init_r1)
