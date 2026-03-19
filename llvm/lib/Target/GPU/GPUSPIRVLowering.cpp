@@ -8,10 +8,13 @@
 //   1. SPIR-V: @_Z33__spirv_BuiltInGlobalInvocationIdi
 //   2. OpenCL: @_Z13get_global_idj (C++ mangled)
 //
-// Builtin Mapping:
-//   get_global_id(0)  → r0 (full thread ID = engine*8 + lane)
+// Current builtin mapping in the shipped software ABI:
+//   get_global_id(0)  → r0 (physical thread ID)
 //   get_local_id(0)   → r0 & 7 (lane within engine)
-//   get_group_id(0)   → r1 (from descriptor)
+//   get_group_id(0)   → r1 (older descriptor convention)
+//
+// Hardware now also exposes logical workgroup IDs through hidden launch
+// context + I_GETSR, but this pass has not migrated to that ABI yet.
 //   mad(a,b,c)        → llvm.fma.f32
 //   min/max           → llvm.minnum/maxnum.f32
 //
@@ -104,13 +107,13 @@ bool GPUSPIRVLowering::lowerBuiltinCalls(Module &M) {
       Value *Result;
 
       if (Kind == 1) {
-        // get_global_id(0) → r0 (full thread ID, not masked)
+        // Current software ABI: get_global_id(0) → r0 (physical thread ID)
         Result = createRegRead(Builder, M, "r0");
       } else if (Kind == 2) {
-        // get_group_id(0) → r1
+        // Current software ABI: get_group_id(0) → r1
         Result = createRegRead(Builder, M, "r1");
       } else {
-        // get_local_id(0) → r0 & 7
+        // Current software ABI: get_local_id(0) → r0 & 7
         Value *R0 = createRegRead(Builder, M, "r0");
         Result = Builder.CreateAnd(R0, Builder.getInt32(7), "lane_id");
       }
