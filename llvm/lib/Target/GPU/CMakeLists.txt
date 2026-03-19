@@ -21,6 +21,7 @@ add_llvm_target(GPUCodeGen
   GPUInstrInfo.cpp
   GPUISelDAGToDAG.cpp
   GPUISelLowering.cpp
+  GPUKernelMetadata.cpp
   GPUMCInstLower.cpp
   GPUPeephole.cpp
   GPURegisterInfo.cpp

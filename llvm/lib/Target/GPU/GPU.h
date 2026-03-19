@@ -41,6 +41,9 @@ void initializeGPUSPIRVLoweringPass(PassRegistry &);
 ModulePass *createGPUHLSLLoweringPass();
 void initializeGPUHLSLLoweringPass(PassRegistry &);
 
+ModulePass *createGPUKernelMetadataPass();
+void initializeGPUKernelMetadataPass(PassRegistry &);
+
 } // namespace llvm
 
 #endif

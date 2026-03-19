@@ -46,11 +46,17 @@ Currently supported source-level pieces on the intended path:
   `GroupMemoryBarrierWithGroupSync()` for the current compute subset
 - HLSL `groupshared` `InterlockedAdd/And/Or/Xor/Min/Max/Exchange/
   CompareExchange` for the current compute subset
+- compiler-emitted `.gpu.meta` launch metadata for:
+  - fixed local size when declared by the frontend
+  - hidden workgroup-context requirement
+  - basic local-memory / atomic / barrier / fence feature bits
+  - original kernel arg count plus direct local-arg mask for the `<=4`-arg path
 
 Still incomplete:
 
 - full simulator-sync parity for these higher-level surfaces
 - any source-level atomic variants outside the currently verified subset
+- richer reflection beyond the current minimal launch record
 
 ## Current Review Notes
 
@@ -92,9 +98,12 @@ authoritative place to change that is the LLVM submodule.
 - `llvm/lib/Target/GPU/GPUTargetMachine.cpp`
   - added the local-global allocation pass for `addrspace(3)` globals
   - stopped flattening local/shared memory into flat global memory
+  - now also runs the kernel-metadata emission pass after frontend lowering and
+    local-global allocation
   - reason: the backend cannot emit honest `LD_LOCAL` / `ST_LOCAL` /
     `ATOMIC_LOCAL` if local/shared memory is erased before instruction
-    selection
+    selection, and the host cannot stop hand-filling launch metadata unless the
+    object carries a stable reflection record
 
 - `llvm/lib/Target/GPU/GPUInstrInfo.td`
   - added machine instruction definitions for `GETSR`, `LD_LOCAL`, `ST_LOCAL`,
@@ -144,8 +153,21 @@ authoritative place to change that is the LLVM submodule.
   - added lowering for `GroupMemoryBarrierWithGroupSync()`
   - added lowering for `groupshared` `Interlocked*`
   - added simple-allocation promotion after lowering
+  - intentionally keeps `hlsl.shader` / `hlsl.numthreads` function attributes
+    alive long enough for the metadata-emission pass to reflect them into
+    `.gpu.meta`
   - reason: HLSL has its own frontend intrinsic shape, so these changes belong
     in the HLSL lowering pass instead of the OpenCL/SPIR-V path
+
+- `llvm/lib/Target/GPU/GPUKernelMetadata.cpp`
+  - new module pass that emits the `.gpu.meta` ELF section
+  - reason: launch metadata belongs in the compiled object, not in duplicated
+    host-side tables or sidecar files
+  - design decision:
+    - phase 1 records only launch-relevant facts shared by both OpenCL and HLSL
+    - fixed local size is only reflected when the frontend declares one
+      (`hlsl.numthreads` or OpenCL `reqd_work_group_size`)
+    - dynamic OpenCL local size remains a runtime choice
 
 - `llvm/lib/Target/GPU/README.md`
   - updated to reflect the current backend ABI and source-level status
@@ -156,6 +178,13 @@ authoritative place to change that is the LLVM submodule.
 
 These tests were added because each new lowering path needs direct backend
 coverage, not just higher-level host tests.
+
+The new `.gpu.meta` object section is currently validated end to end through
+the superproject host loader/simulator tests rather than a dedicated LLVM lit
+object-section test. That is intentional for now: the guaranteed local tool
+surface in this repo is `llc`, `gpu-compiler`, `clang`, and `FileCheck`, while
+the host harness already proves the full chain of section emission, ELF
+loading, reflected descriptor build, and execution.
 
 - `llvm/test/CodeGen/GPU/hlsl-thread-ids.ll`
   - proves HLSL system-value lowering uses raw workgroup state / derived IDs

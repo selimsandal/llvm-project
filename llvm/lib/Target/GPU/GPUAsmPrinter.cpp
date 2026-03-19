@@ -1,8 +1,9 @@
 //===-- GPUAsmPrinter.cpp - GPU Assembly Printer ----------===//
 //
-// Emits raw binary GPU instructions. No ELF, no sections.
-// Two 128-bit instructions packed per 256-bit beat.
-// Padded with NOP if odd instruction count.
+// Emits GPU machine code into the ELF object streamer.
+// .text contains raw 128-bit GPU instructions packed two per 256-bit beat.
+// The object may also carry auxiliary sections such as .gpu.meta emitted by
+// earlier IR passes.
 //
 //===--------------------------------------------------------------===//
 

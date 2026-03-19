@@ -1124,18 +1124,6 @@ bool GPUHLSLLowering::stripHLSLMetadata(Module &M) {
     }
   }
 
-  // Strip HLSL-specific function attributes
-  for (Function &F : M) {
-    if (F.hasFnAttribute("hlsl.shader")) {
-      F.removeFnAttr("hlsl.shader");
-      Changed = true;
-    }
-    if (F.hasFnAttribute("hlsl.numthreads")) {
-      F.removeFnAttr("hlsl.numthreads");
-      Changed = true;
-    }
-  }
-
   return Changed;
 }
 
