@@ -165,6 +165,7 @@ const char *GPUTargetLowering::getTargetNodeName(unsigned Opcode) const {
   switch ((GPUISD::NodeType)Opcode) {
   case GPUISD::FIRST_NUMBER: break;
   case GPUISD::MOVI:    return "GPUISD::MOVI";
+  case GPUISD::GETSR:   return "GPUISD::GETSR";
   case GPUISD::CMP:     return "GPUISD::CMP";
   case GPUISD::SEL:     return "GPUISD::SEL";
   case GPUISD::BRCOND:  return "GPUISD::BRCOND";
@@ -357,7 +358,24 @@ SDValue GPUTargetLowering::LowerReturn(
     const SmallVectorImpl<ISD::OutputArg> &Outs,
     const SmallVectorImpl<SDValue> &OutVals, const SDLoc &DL,
     SelectionDAG &DAG) const {
-  return DAG.getNode(GPUISD::RETURN, DL, MVT::Other, Chain);
+  SmallVector<CCValAssign, 4> RVLocs;
+  CCState CCInfo(CallConv, IsVarArg, DAG.getMachineFunction(), RVLocs,
+                 *DAG.getContext());
+  CCInfo.AnalyzeReturn(Outs, RetCC_GPU);
+
+  SmallVector<SDValue, 2> RetRegs;
+  for (const CCValAssign &VA : RVLocs) {
+    assert(VA.isRegLoc() && "GPU only supports register return values");
+    Chain = DAG.getCopyToReg(Chain, DL, VA.getLocReg(),
+                             OutVals[VA.getValNo()]);
+    RetRegs.push_back(DAG.getRegister(VA.getLocReg(),
+                                      OutVals[VA.getValNo()].getValueType()));
+  }
+
+  SmallVector<SDValue, 2> RetOps;
+  RetOps.push_back(Chain);
+  RetOps.append(RetRegs.begin(), RetRegs.end());
+  return DAG.getNode(GPUISD::RETURN, DL, MVT::Other, RetOps);
 }
 
 SDValue GPUTargetLowering::LowerINTRINSIC_WO_CHAIN(SDValue Op,
@@ -369,6 +387,9 @@ SDValue GPUTargetLowering::LowerINTRINSIC_WO_CHAIN(SDValue Op,
   switch (IntrID) {
   default:
     return SDValue(); // Not ours
+  case Intrinsic::gpu_getsr:
+    return DAG.getNode(GPUISD::GETSR, DL, Op.getValueType(),
+                       Op.getOperand(1));
   case Intrinsic::gpu_reduce_add:  ReduceOp = 0; break;
   case Intrinsic::gpu_reduce_and:  ReduceOp = 1; break;
   case Intrinsic::gpu_reduce_or:   ReduceOp = 2; break;

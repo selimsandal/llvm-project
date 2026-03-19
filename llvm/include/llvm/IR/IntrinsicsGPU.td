@@ -5,6 +5,17 @@
 
 let TargetPrefix = "gpu" in {
 
+def int_gpu_getsr : DefaultAttrsIntrinsic<[llvm_i32_ty], [llvm_i32_ty],
+                            [IntrNoMem]>;
+
+def int_gpu_workgroup_sync : DefaultAttrsIntrinsic<[], [llvm_i32_ty],
+                                   [IntrWriteMem, IntrInaccessibleMemOnly,
+                                    IntrConvergent]>;
+
+def int_gpu_mem_fence : DefaultAttrsIntrinsic<[], [llvm_i32_ty],
+                            [IntrWriteMem, IntrInaccessibleMemOnly,
+                             IntrConvergent]>;
+
 // Integer reductions (i32 -> i32)
 def int_gpu_reduce_add  : DefaultAttrsIntrinsic<[llvm_i32_ty], [llvm_i32_ty],
                             [IntrNoMem, IntrConvergent]>;

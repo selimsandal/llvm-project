@@ -13,6 +13,7 @@ namespace GPUISD {
 enum NodeType : unsigned {
   FIRST_NUMBER = ISD::BUILTIN_OP_END,
   MOVI,       // Move immediate
+  GETSR,      // Read raw special register
   CMP,        // Compare (writes flag register via glue)
   SEL,        // Select based on flag register
   BRCOND,     // Conditional branch (flag-based, with invert)

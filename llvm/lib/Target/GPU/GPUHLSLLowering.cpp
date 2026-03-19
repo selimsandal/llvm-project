@@ -12,20 +12,21 @@
 //     → llc -march=gpu -filetype=obj
 //     → GPU ELF object
 //
-// Current intrinsic mapping in the shipped software ABI:
-//   SV_DispatchThreadID    → r0 (physical thread ID)
-//   SV_GroupID             → r1 (older descriptor convention)
-//   SV_GroupThreadID       → r0 & 7 (lane within engine)
-//   SV_GroupIndex          → r0 & 7
-//   WaveGetLaneIndex()     → r0 & 7
+// Current system-value mapping is based on raw workgroup state from hidden
+// launch context + I_GETSR:
+//   SV_GroupID             → group_id
+//   SV_GroupThreadID       → local_id
+//   SV_DispatchThreadID    → group_id * local_size + local_id
+//   SV_GroupIndex          → compiler-derived linear local_id
+//   WaveGetLaneIndex()     → local_id - subgroup_local_base
 //   WaveGetLaneCount()     → 8 (constant)
 //
-// Hardware now also exposes raw workgroup state through hidden launch
-// context + I_GETSR:
-//   group_id, local_size, num_groups, subgroup-local base, local_id
-// The intended migration is to derive higher-level HLSL system values like
-// DispatchThreadID from group_id * local_size + local_id in the compiler,
-// but this pass has not migrated to that ABI yet.
+// Current verified source-level HLSL compute subset also includes:
+//   groupshared globals    → addrspace(3) globals → LD_LOCAL/ST_LOCAL
+//   GroupMemoryBarrierWithGroupSync()
+//                         → llvm.gpu.workgroup.sync(0)
+// The sync lowering is intentionally conservative for now and uses the strong
+// barrier mode instead of a narrower groupshared-only mode.
 //
 // Resource Binding → GPU Register Mapping:
 //   register(u0/t0/b0)    → r1 (descriptor init_r1)
@@ -54,6 +55,8 @@
 #include "llvm/Pass.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
 
 using namespace llvm;
 
@@ -74,9 +77,12 @@ public:
 
 private:
   bool lowerThreadIDIntrinsics(Module &M);
+  bool lowerSyncIntrinsics(Module &M);
+  bool lowerSharedAtomicCalls(Module &M);
   bool lowerResourceAccess(Module &M);
   bool lowerWaveIntrinsics(Module &M);
   bool lowerMathIntrinsics(Module &M);
+  bool promoteSimpleAllocas(Module &M);
   bool stripHLSLMetadata(Module &M);
 };
 
@@ -95,6 +101,157 @@ static Value *createRegRead(IRBuilder<> &Builder, Module &M,
       M.getContext(), RegMD)});
 }
 
+enum GPUSReg : unsigned {
+  SREG_GROUP_ID_X = 48,
+  SREG_GROUP_ID_Y = 49,
+  SREG_GROUP_ID_Z = 50,
+  SREG_LOCAL_SIZE_X = 51,
+  SREG_LOCAL_SIZE_Y = 52,
+  SREG_LOCAL_SIZE_Z = 53,
+  SREG_SUBGROUP_LOCAL_BASE_X = 60,
+  SREG_LOCAL_ID_X = 59,
+  SREG_LOCAL_ID_Y = 61,
+  SREG_LOCAL_ID_Z = 62,
+  SREG_SUBGROUP_LOCAL_BASE_Y = 63,
+  SREG_SUBGROUP_LOCAL_BASE_Z = 64,
+};
+
+static Value *createGpuGetSR(IRBuilder<> &Builder, Module &M, unsigned SReg) {
+  Function *GetSR = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::gpu_getsr,
+                                                      {});
+  return Builder.CreateCall(GetSR, {Builder.getInt32(SReg)});
+}
+
+static Value *createLinearIndex(IRBuilder<> &Builder,
+                                Value *X, Value *Y, Value *Z,
+                                Value *SizeX, Value *SizeY) {
+  Value *ScaledZ = Builder.CreateMul(Z, SizeY, "lin_z");
+  Value *YZ = Builder.CreateAdd(Y, ScaledZ, "lin_yz");
+  return Builder.CreateAdd(X, Builder.CreateMul(YZ, SizeX, "lin_xy"),
+                           "lin_idx");
+}
+
+static Value *createDimSelect(IRBuilder<> &Builder, Value *Dim,
+                              Value *X, Value *Y, Value *Z) {
+  Value *IsX = Builder.CreateICmpEQ(Dim, Builder.getInt32(0));
+  Value *IsY = Builder.CreateICmpEQ(Dim, Builder.getInt32(1));
+  return Builder.CreateSelect(IsX, X, Builder.CreateSelect(IsY, Y, Z));
+}
+
+static Value *createGroupID(IRBuilder<> &Builder, Module &M, Value *Dim) {
+  return createDimSelect(Builder, Dim,
+      createGpuGetSR(Builder, M, SREG_GROUP_ID_X),
+      createGpuGetSR(Builder, M, SREG_GROUP_ID_Y),
+      createGpuGetSR(Builder, M, SREG_GROUP_ID_Z));
+}
+
+static Value *createLocalID(IRBuilder<> &Builder, Module &M, Value *Dim) {
+  return createDimSelect(Builder, Dim,
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_Y),
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_Z));
+}
+
+static Value *createLocalSize(IRBuilder<> &Builder, Module &M, Value *Dim) {
+  return createDimSelect(Builder, Dim,
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_Y),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_Z));
+}
+
+static Value *createDispatchThreadID(IRBuilder<> &Builder, Module &M,
+                                     Value *Dim) {
+  Value *GroupID = createGroupID(Builder, M, Dim);
+  Value *LocalSize = createLocalSize(Builder, M, Dim);
+  Value *LocalID = createLocalID(Builder, M, Dim);
+  return Builder.CreateAdd(Builder.CreateMul(GroupID, LocalSize), LocalID,
+                           "dispatch_id");
+}
+
+static Value *createFlattenedThreadID(IRBuilder<> &Builder, Module &M) {
+  return createLinearIndex(Builder,
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_Y),
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_Z),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_Y));
+}
+
+static Value *createWaveLaneIndex(IRBuilder<> &Builder, Module &M) {
+  Value *LocalLinear = createLinearIndex(Builder,
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_Y),
+      createGpuGetSR(Builder, M, SREG_LOCAL_ID_Z),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_Y));
+  Value *BaseLinear = createLinearIndex(Builder,
+      createGpuGetSR(Builder, M, SREG_SUBGROUP_LOCAL_BASE_X),
+      createGpuGetSR(Builder, M, SREG_SUBGROUP_LOCAL_BASE_Y),
+      createGpuGetSR(Builder, M, SREG_SUBGROUP_LOCAL_BASE_Z),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_X),
+      createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_Y));
+  return Builder.CreateSub(LocalLinear, BaseLinear, "wave_lane");
+}
+
+enum HLSLSharedAtomicKind {
+  HLSL_SHARED_ATOMIC_NONE = 0,
+  HLSL_SHARED_ATOMIC_ADD,
+  HLSL_SHARED_ATOMIC_AND,
+  HLSL_SHARED_ATOMIC_OR,
+  HLSL_SHARED_ATOMIC_XOR,
+  HLSL_SHARED_ATOMIC_MIN,
+  HLSL_SHARED_ATOMIC_MAX,
+  HLSL_SHARED_ATOMIC_EXCHANGE,
+  HLSL_SHARED_ATOMIC_CMPXCHG,
+};
+
+static HLSLSharedAtomicKind classifySharedAtomicCall(StringRef Name) {
+  if (Name.contains("InterlockedCompareExchange"))
+    return HLSL_SHARED_ATOMIC_CMPXCHG;
+  if (Name.contains("InterlockedExchange"))
+    return HLSL_SHARED_ATOMIC_EXCHANGE;
+  if (Name.contains("InterlockedAdd"))
+    return HLSL_SHARED_ATOMIC_ADD;
+  if (Name.contains("InterlockedAnd"))
+    return HLSL_SHARED_ATOMIC_AND;
+  if (Name.contains("InterlockedOr"))
+    return HLSL_SHARED_ATOMIC_OR;
+  if (Name.contains("InterlockedXor"))
+    return HLSL_SHARED_ATOMIC_XOR;
+  if (Name.contains("InterlockedMin"))
+    return HLSL_SHARED_ATOMIC_MIN;
+  if (Name.contains("InterlockedMax"))
+    return HLSL_SHARED_ATOMIC_MAX;
+  return HLSL_SHARED_ATOMIC_NONE;
+}
+
+static bool isUnsignedSharedAtomic(StringRef Name) {
+  return Name.contains('j') || Name.contains("uint") ||
+         Name.contains("_unsigned");
+}
+
+static bool promoteFunctionAllocas(Function &F) {
+  if (F.isDeclaration() || F.empty())
+    return false;
+
+  BasicBlock &Entry = F.getEntryBlock();
+  SmallVector<AllocaInst *, 8> Allocas;
+  for (Instruction &I : Entry) {
+    auto *AI = dyn_cast<AllocaInst>(&I);
+    if (!AI)
+      continue;
+    if (isAllocaPromotable(AI))
+      Allocas.push_back(AI);
+  }
+
+  if (Allocas.empty())
+    return false;
+
+  DominatorTree DT(F);
+  PromoteMemToReg(Allocas, DT);
+  return true;
+}
+
 // Classify DX intrinsic by function name (avoids dependency on
 // IntrinsicsDirectX.h being generated for this target build).
 enum DXIntrinsicKind {
@@ -104,6 +261,7 @@ enum DXIntrinsicKind {
   DX_GROUP_ID,              // llvm.dx.group.id
   DX_THREAD_ID_IN_GROUP,    // llvm.dx.thread.id.in.group
   DX_FLATTENED_THREAD_ID,   // llvm.dx.flattened.thread.id.in.group
+  DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC,
   // Resources
   DX_HANDLE_FROM_BINDING,   // llvm.dx.resource.handlefrombinding
   DX_HANDLE_FROM_IMPLICIT,  // llvm.dx.resource.handlefromimplicitbinding
@@ -149,6 +307,8 @@ static DXIntrinsicKind classifyDXIntrinsic(StringRef Name) {
   if (Name == "llvm.dx.group.id")                        return DX_GROUP_ID;
   if (Name == "llvm.dx.thread.id.in.group")              return DX_THREAD_ID_IN_GROUP;
   if (Name == "llvm.dx.flattened.thread.id.in.group")    return DX_FLATTENED_THREAD_ID;
+  if (Name == "llvm.dx.group.memory.barrier.with.group.sync")
+    return DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC;
 
   // Resources (overloaded intrinsics have type suffixes)
   if (Name.starts_with("llvm.dx.resource.handlefrombinding"))
@@ -227,46 +387,28 @@ bool GPUHLSLLowering::lowerThreadIDIntrinsics(Module &M) {
 
       switch (Kind) {
       case DX_THREAD_ID: {
-        // Current software ABI: SV_DispatchThreadID.x → r0 (physical thread ID)
-        // For dim > 0, return 0 (1D dispatch only)
-        if (auto *DimC = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
-          if (DimC->isZero())
-            Result = createRegRead(Builder, M, "r0");
-          else
-            Result = Builder.getInt32(0);
-        } else {
-          Result = createRegRead(Builder, M, "r0");
-        }
+        Result = createDispatchThreadID(Builder, M, CI->getArgOperand(0));
         break;
       }
       case DX_GROUP_ID: {
-        // Current software ABI: SV_GroupID.x → r1
-        if (auto *DimC = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
-          if (DimC->isZero())
-            Result = createRegRead(Builder, M, "r1");
-          else
-            Result = Builder.getInt32(0);
-        } else {
-          Result = createRegRead(Builder, M, "r1");
-        }
+        Result = createGroupID(Builder, M, CI->getArgOperand(0));
         break;
       }
       case DX_THREAD_ID_IN_GROUP:
-      case DX_FLATTENED_THREAD_ID:
-      case DX_WAVE_GETLANEINDEX: {
-        // Current software ABI: lane index within engine → r0 & 7
-        Value *R0 = createRegRead(Builder, M, "r0");
-        Result = Builder.CreateAnd(R0, Builder.getInt32(7), "lane_id");
+        Result = createLocalID(Builder, M, CI->getArgOperand(0));
         break;
-      }
+      case DX_FLATTENED_THREAD_ID:
+        Result = createFlattenedThreadID(Builder, M);
+        break;
+      case DX_WAVE_GETLANEINDEX:
+        Result = createWaveLaneIndex(Builder, M);
+        break;
       case DX_WAVE_GET_LANE_COUNT:
         // GPU has 8 lanes per engine (fixed)
         Result = Builder.getInt32(8);
         break;
       case DX_WAVE_IS_FIRST_LANE: {
-        // First lane = lane 0 → (r0 & 7) == 0
-        Value *R0 = createRegRead(Builder, M, "r0");
-        Value *Lane = Builder.CreateAnd(R0, Builder.getInt32(7));
+        Value *Lane = createWaveLaneIndex(Builder, M);
         Result = Builder.CreateICmpEQ(Lane, Builder.getInt32(0),
                                       "is_first_lane");
         break;
@@ -290,6 +432,152 @@ bool GPUHLSLLowering::lowerThreadIDIntrinsics(Module &M) {
   for (Function *F : ToDelete)
     F->eraseFromParent();
 
+  return Changed;
+}
+
+bool GPUHLSLLowering::lowerSyncIntrinsics(Module &M) {
+  bool Changed = false;
+  SmallVector<CallInst *, 8> ToReplace;
+  SmallVector<Function *, 4> ToDelete;
+
+  for (Function &F : M) {
+    DXIntrinsicKind Kind = classifyDXIntrinsic(F.getName());
+    if (Kind != DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC)
+      continue;
+
+    for (User *U : F.users()) {
+      if (auto *CI = dyn_cast<CallInst>(U))
+        ToReplace.push_back(CI);
+    }
+
+    for (CallInst *CI : ToReplace) {
+      IRBuilder<> Builder(CI);
+      Function *Barrier =
+          Intrinsic::getOrInsertDeclaration(&M, Intrinsic::gpu_workgroup_sync,
+                                            {});
+      // Use the conservative strong/all-memory barrier mode for now.
+      // It is stricter than pure groupshared ordering, but correct on the
+      // current hardware/software contract.
+      Builder.CreateCall(Barrier, {Builder.getInt32(0)});
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    ToReplace.clear();
+
+    if (F.use_empty())
+      ToDelete.push_back(&F);
+  }
+
+  for (Function *F : ToDelete)
+    F->eraseFromParent();
+
+  return Changed;
+}
+
+bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
+  bool Changed = false;
+  SmallVector<CallInst *, 16> ToReplace;
+  SmallVector<Function *, 8> ToDelete;
+
+  for (Function &F : M) {
+    if (!F.isDeclaration())
+      continue;
+    HLSLSharedAtomicKind Kind = classifySharedAtomicCall(F.getName());
+    if (Kind == HLSL_SHARED_ATOMIC_NONE)
+      continue;
+
+    for (User *U : F.users()) {
+      if (auto *CI = dyn_cast<CallInst>(U))
+        ToReplace.push_back(CI);
+    }
+
+    for (CallInst *CI : ToReplace) {
+      if (CI->arg_size() < 2)
+        continue;
+
+      auto *PtrTy = dyn_cast<PointerType>(CI->getArgOperand(0)->getType());
+      if (!PtrTy || PtrTy->getAddressSpace() != 3)
+        continue;
+
+      IRBuilder<> Builder(CI);
+      Value *OldValue = nullptr;
+
+      switch (Kind) {
+      case HLSL_SHARED_ATOMIC_ADD:
+      case HLSL_SHARED_ATOMIC_AND:
+      case HLSL_SHARED_ATOMIC_OR:
+      case HLSL_SHARED_ATOMIC_XOR:
+      case HLSL_SHARED_ATOMIC_MIN:
+      case HLSL_SHARED_ATOMIC_MAX:
+      case HLSL_SHARED_ATOMIC_EXCHANGE: {
+        AtomicRMWInst::BinOp Op = AtomicRMWInst::Add;
+        switch (Kind) {
+        case HLSL_SHARED_ATOMIC_ADD:      Op = AtomicRMWInst::Add; break;
+        case HLSL_SHARED_ATOMIC_AND:      Op = AtomicRMWInst::And; break;
+        case HLSL_SHARED_ATOMIC_OR:       Op = AtomicRMWInst::Or; break;
+        case HLSL_SHARED_ATOMIC_XOR:      Op = AtomicRMWInst::Xor; break;
+        case HLSL_SHARED_ATOMIC_EXCHANGE: Op = AtomicRMWInst::Xchg; break;
+        case HLSL_SHARED_ATOMIC_MIN:
+          Op = isUnsignedSharedAtomic(F.getName()) ? AtomicRMWInst::UMin
+                                                   : AtomicRMWInst::Min;
+          break;
+        case HLSL_SHARED_ATOMIC_MAX:
+          Op = isUnsignedSharedAtomic(F.getName()) ? AtomicRMWInst::UMax
+                                                   : AtomicRMWInst::Max;
+          break;
+        case HLSL_SHARED_ATOMIC_NONE:
+        case HLSL_SHARED_ATOMIC_CMPXCHG:
+          break;
+        }
+        OldValue = Builder.CreateAtomicRMW(
+            Op, CI->getArgOperand(0), CI->getArgOperand(1), MaybeAlign(4),
+            AtomicOrdering::SequentiallyConsistent);
+        break;
+      }
+      case HLSL_SHARED_ATOMIC_CMPXCHG: {
+        if (CI->arg_size() < 3)
+          continue;
+        auto *Pair = Builder.CreateAtomicCmpXchg(
+            CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2),
+            MaybeAlign(4), AtomicOrdering::SequentiallyConsistent,
+            AtomicOrdering::SequentiallyConsistent);
+        OldValue = Builder.CreateExtractValue(Pair, 0, "interlocked_old");
+        break;
+      }
+      case HLSL_SHARED_ATOMIC_NONE:
+        break;
+      }
+
+      if (!OldValue)
+        continue;
+
+      if (!CI->getType()->isVoidTy()) {
+        CI->replaceAllUsesWith(OldValue);
+      } else if ((Kind != HLSL_SHARED_ATOMIC_CMPXCHG && CI->arg_size() >= 3) ||
+                 (Kind == HLSL_SHARED_ATOMIC_CMPXCHG && CI->arg_size() >= 4)) {
+        unsigned OutIdx = (Kind == HLSL_SHARED_ATOMIC_CMPXCHG) ? 3 : 2;
+        Builder.CreateStore(OldValue, CI->getArgOperand(OutIdx));
+      }
+
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    ToReplace.clear();
+
+    if (F.use_empty())
+      ToDelete.push_back(&F);
+  }
+
+  for (Function *F : ToDelete)
+    F->eraseFromParent();
+
+  return Changed;
+}
+
+bool GPUHLSLLowering::promoteSimpleAllocas(Module &M) {
+  bool Changed = false;
+  for (Function &F : M)
+    Changed |= promoteFunctionAllocas(F);
   return Changed;
 }
 
@@ -858,17 +1146,22 @@ bool GPUHLSLLowering::stripHLSLMetadata(Module &M) {
 bool GPUHLSLLowering::runOnModule(Module &M) {
   // Quick check: does this module contain any DX intrinsics?
   bool HasDX = false;
+  bool HasHLSL = false;
   for (const Function &F : M) {
     if (F.getName().starts_with("llvm.dx.")) {
       HasDX = true;
-      break;
     }
+    if (F.hasFnAttribute("hlsl.shader"))
+      HasHLSL = true;
   }
-  if (!HasDX)
+  if (!HasDX && !HasHLSL)
     return false;
 
   bool Changed = false;
   Changed |= lowerThreadIDIntrinsics(M);
+  Changed |= lowerSyncIntrinsics(M);
+  Changed |= lowerSharedAtomicCalls(M);
+  Changed |= promoteSimpleAllocas(M);
   Changed |= lowerResourceAccess(M);
   Changed |= lowerWaveIntrinsics(M);
   Changed |= lowerMathIntrinsics(M);
