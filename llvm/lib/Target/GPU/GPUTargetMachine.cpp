@@ -35,6 +35,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeGPUTarget() {
   initializeGPUPeepholePass(PR);
   initializeGPUSPIRVLoweringPass(PR);
   initializeGPUHLSLLoweringPass(PR);
+  initializeGPUKernelMetadataPass(PR);
 }
 
 GPUTargetMachine::GPUTargetMachine(const Target &T, const Triple &TT,
@@ -123,6 +124,7 @@ public:
     addPass(createGPUSPIRVLoweringPass());
     addPass(createGPUHLSLLoweringPass());
     addPass(createGPULocalMemoryGlobalsPass());
+    addPass(createGPUKernelMetadataPass());
     // Keep addrspace(3) distinct so local/shared memory reaches target lowering
     // as real local-memory operations instead of being flattened to global.
     // Feed the backend already-structured CFG whenever possible so the late

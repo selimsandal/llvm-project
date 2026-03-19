@@ -1,8 +1,8 @@
 //===-- GPUAsmBackend.cpp - GPU Assembler Backend --------===//
 //
 // Minimal AsmBackend for ELF container output.
-// The .text section contains raw 128-bit GPU instructions.
-// Host loader extracts the .text segment for DMA upload.
+// .text contains raw 128-bit GPU instructions.
+// Optional sidecar sections such as .gpu.meta carry launch/reflection data.
 //
 //===--------------------------------------------------------------===//
 
