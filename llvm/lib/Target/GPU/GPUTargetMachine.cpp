@@ -31,6 +31,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeGPUTarget() {
   RegisterTargetMachine<GPUTargetMachine> X(getTheGPUTarget());
   PassRegistry &PR = *PassRegistry::getPassRegistry();
   initializeGPUDAGToDAGISelLegacyPass(PR);
+  initializeGPUArgRegCopyPass(PR);
   initializeGPUControlFlowPass(PR);
   initializeGPUPeepholePass(PR);
   initializeGPUSPIRVLoweringPass(PR);
@@ -132,12 +133,21 @@ public:
     addPass(createFixIrreduciblePass());
     addPass(createUnifyLoopExitsPass());
     addPass(createStructurizeCFGPass(/*SkipUniformRegions=*/false));
+    // StructurizeCFG is still useful for harder loop/exit shapes, but it can
+    // leave small acyclic regions in a sentinel/phi-heavy form. A follow-up
+    // SimplifyCFG pass recovers the simple cases so the late machine pass sees
+    // structured regions instead of Flow-style glue blocks.
+    addPass(createCFGSimplificationPass());
     TargetPassConfig::addIRPasses();
   }
 
   bool addInstSelector() override {
     addPass(createGPUISelDag(getGPUTargetMachine(), getOptLevel()));
     return false;
+  }
+
+  void addPreRegAlloc() override {
+    addPass(createGPUArgRegCopyPass());
   }
 
   void addPreEmitPass() override {

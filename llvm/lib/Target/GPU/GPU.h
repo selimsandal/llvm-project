@@ -29,6 +29,9 @@ FunctionPass *createGPUISelDag(GPUTargetMachine &TM,
 
 void initializeGPUDAGToDAGISelLegacyPass(PassRegistry &);
 
+FunctionPass *createGPUArgRegCopyPass();
+void initializeGPUArgRegCopyPass(PassRegistry &);
+
 FunctionPass *createGPUControlFlowPass();
 void initializeGPUControlFlowPass(PassRegistry &);
 

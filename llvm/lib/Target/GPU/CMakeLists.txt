@@ -14,6 +14,7 @@ tablegen(LLVM GPUGenSubtargetInfo.inc -gen-subtarget)
 add_public_tablegen_target(GPUCommonTableGen)
 
 add_llvm_target(GPUCodeGen
+  GPUArgRegCopy.cpp
   GPUAsmPrinter.cpp
   GPUControlFlow.cpp
   GPUFrameLowering.cpp

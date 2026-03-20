@@ -227,13 +227,58 @@ static bool needsOperandSwap(ISD::CondCode CC) {
   }
 }
 
+static bool isSignedIntCondCode(ISD::CondCode CC) {
+  switch (CC) {
+  case ISD::SETLT:
+  case ISD::SETLE:
+  case ISD::SETGT:
+  case ISD::SETGE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static SDValue lowerSignedIntSetCC(const SDLoc &DL, SDValue LHS, SDValue RHS,
+                                   ISD::CondCode CC, SelectionDAG &DAG) {
+  assert(LHS.getValueType() == MVT::i32 && RHS.getValueType() == MVT::i32 &&
+         "GPU signed integer compare lowering expects i32 operands");
+
+  SDValue Extremum;
+  SDValue IsChosen;
+  SDValue IsNotEqual;
+
+  switch (CC) {
+  case ISD::SETLT:
+    Extremum = DAG.getNode(ISD::SMIN, DL, MVT::i32, LHS, RHS);
+    IsChosen = DAG.getSetCC(DL, MVT::i32, Extremum, LHS, ISD::SETEQ);
+    IsNotEqual = DAG.getSetCC(DL, MVT::i32, LHS, RHS, ISD::SETNE);
+    return DAG.getNode(ISD::AND, DL, MVT::i32, IsChosen, IsNotEqual);
+  case ISD::SETLE:
+    Extremum = DAG.getNode(ISD::SMIN, DL, MVT::i32, LHS, RHS);
+    return DAG.getSetCC(DL, MVT::i32, Extremum, LHS, ISD::SETEQ);
+  case ISD::SETGT:
+    Extremum = DAG.getNode(ISD::SMAX, DL, MVT::i32, LHS, RHS);
+    IsChosen = DAG.getSetCC(DL, MVT::i32, Extremum, LHS, ISD::SETEQ);
+    IsNotEqual = DAG.getSetCC(DL, MVT::i32, LHS, RHS, ISD::SETNE);
+    return DAG.getNode(ISD::AND, DL, MVT::i32, IsChosen, IsNotEqual);
+  case ISD::SETGE:
+    Extremum = DAG.getNode(ISD::SMAX, DL, MVT::i32, LHS, RHS);
+    return DAG.getSetCC(DL, MVT::i32, Extremum, LHS, ISD::SETEQ);
+  default:
+    llvm_unreachable("unexpected signed integer condition code");
+  }
+}
+
 SDValue GPUTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   SDValue LHS = Op.getOperand(0);
   SDValue RHS = Op.getOperand(1);
   ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(2))->get();
 
-  
+  if (!LHS.getValueType().isFloatingPoint() && isSignedIntCondCode(CC))
+    return lowerSignedIntSetCC(DL, LHS, RHS, CC, DAG);
+
   bool NeedInvert;
   unsigned HWCond = mapCondCode(CC, NeedInvert);
 
@@ -265,7 +310,19 @@ SDValue GPUTargetLowering::LowerSELECT_CC(SDValue Op,
   SDValue FalseVal = Op.getOperand(3);
   ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(4))->get();
 
-  
+  if (!LHS.getValueType().isFloatingPoint() && isSignedIntCondCode(CC)) {
+    SDValue Bool = lowerSignedIntSetCC(DL, LHS, RHS, CC, DAG);
+    SDValue One = DAG.getConstant(1, DL, MVT::i32);
+    SDValue Cmp = DAG.getNode(GPUISD::CMP, DL, MVT::Glue,
+                              DAG.getTargetConstant(0, DL, MVT::i32),
+                              Bool, One,
+                              DAG.getTargetConstant(0, DL, MVT::i32));
+    return DAG.getNode(GPUISD::SEL, DL, Op.getValueType(),
+                       TrueVal, FalseVal,
+                       DAG.getTargetConstant(0, DL, MVT::i32),
+                       Cmp);
+  }
+
   bool NeedInvert;
   unsigned HWCond = mapCondCode(CC, NeedInvert);
 
@@ -294,7 +351,21 @@ SDValue GPUTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
   SDValue RHS = Op.getOperand(3);
   SDValue Dest = Op.getOperand(4);
 
-  
+  if (!LHS.getValueType().isFloatingPoint() && isSignedIntCondCode(CC)) {
+    SDValue Bool = lowerSignedIntSetCC(DL, LHS, RHS, CC, DAG);
+    SDValue One = DAG.getConstant(1, DL, MVT::i32);
+    SDValue Cmp = DAG.getNode(GPUISD::CMP, DL, MVT::Glue,
+                              DAG.getTargetConstant(0, DL, MVT::i32),
+                              Bool, One,
+                              DAG.getTargetConstant(0, DL, MVT::i32));
+    return DAG.getNode(GPUISD::BRCOND, DL, MVT::Other,
+                       Chain,
+                       DAG.getTargetConstant(0, DL, MVT::i32),
+                       DAG.getTargetConstant(0, DL, MVT::i32),
+                       Dest,
+                       Cmp);
+  }
+
   bool NeedInvert;
   unsigned HWCond = mapCondCode(CC, NeedInvert);
 

@@ -169,6 +169,23 @@ authoritative place to change that is the LLVM submodule.
       (`hlsl.numthreads` or OpenCL `reqd_work_group_size`)
     - dynamic OpenCL local size remains a runtime choice
 
+- `llvm/lib/Target/GPU/GPUControlFlow.cpp`
+  - keeps the reverse/forward leaf-first conditional scan and the
+    triangle-before-diamond preference
+  - preserves an outer condition only when the same flag is clobbered in the
+    trailing straight-line tail of the true path
+  - explicitly does not preserve through already-lowered nested structured
+    control flow in the same block
+  - reason: the mandelbrot loop needs the straight-line clobber case, while
+    PathTracer regressed badly when nested compares inside already-structured
+    regions were treated as if they still belonged to the outer branch
+
+- `llvm/lib/Target/GPU/GPURegisterInfo.cpp`
+  - keeps only `r0` and `r30` globally reserved
+  - reason: globally reserving an extra late control-flow scratch register
+    perturbed PathTracer register allocation and changed code shape enough to
+    create false semantic mismatches in the compare harness
+
 - `llvm/lib/Target/GPU/README.md`
   - updated to reflect the current backend ABI and source-level status
   - reason: reviewers need the local compiler contract documented next to the
@@ -209,6 +226,15 @@ loading, reflected descriptor build, and execution.
     path from regressing again
 - `llvm/test/CodeGen/GPU/opencl-local-atomic-builtins.ll`
   - proves source-level OpenCL local atomic builtins lower to local atomics
+- `llvm/test/CodeGen/GPU/signed-int-compare.ll`
+  - now matches the current signed-compare lowering shape
+  - reason: the backend intentionally expands signed compares through
+    `SMIN/SMAX` plus compares/selects rather than pretending there is a native
+    signed-branch instruction
+- `llvm/test/CodeGen/GPU/control-flow-comprehensive.ll`
+  - now matches the current triangle lowering shape
+  - reason: the backend currently prefers a branchless select form for that
+    simple triangle instead of forcing a `goto/join` pair
 
 ## Pipeline
 
