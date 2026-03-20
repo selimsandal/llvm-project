@@ -52,6 +52,21 @@ static bool materializeConstantBase(SelectionDAG *DAG, SDLoc DL,
   return true;
 }
 
+static bool getImm32Bits(SDValue Val, uint32_t &Bits) {
+  if (auto *C = dyn_cast<ConstantSDNode>(Val)) {
+    Bits = static_cast<uint32_t>(C->getZExtValue());
+    return true;
+  }
+
+  if (auto *CFP = dyn_cast<ConstantFPSDNode>(Val)) {
+    Bits = static_cast<uint32_t>(
+        CFP->getValueAPF().bitcastToAPInt().getZExtValue());
+    return true;
+  }
+
+  return false;
+}
+
 class GPUDAGToDAGISel : public SelectionDAGISel {
   const GPUSubtarget *Subtarget;
 
@@ -176,6 +191,18 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
     SDValue FalseVal = N->getOperand(1);
     unsigned FlagReg = N->getConstantOperandVal(2);
     SDValue Glue = N->getOperand(3);
+    uint32_t FalseImmBits;
+
+    if (getImm32Bits(FalseVal, FalseImmBits)) {
+      SDNode *SelImmNode = CurDAG->getMachineNode(
+          GPU::SELi, DL, N->getValueType(0),
+          {TrueVal,
+           CurDAG->getTargetConstant(FalseImmBits, DL, MVT::i32),
+           CurDAG->getTargetConstant(FlagReg, DL, MVT::i32),
+           Glue});
+      ReplaceNode(N, SelImmNode);
+      return;
+    }
 
     SDNode *SelNode = CurDAG->getMachineNode(
         GPU::SEL, DL, N->getValueType(0),

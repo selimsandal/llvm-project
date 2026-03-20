@@ -29,6 +29,7 @@
 #include "GPU.h"
 #include "GPURegisterInfo.h"
 #include "MCTargetDesc/GPUMCTargetDesc.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -39,6 +40,7 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
@@ -74,13 +76,17 @@ public:
 private:
   const TargetInstrInfo *TII = nullptr;
 
-  bool getBranchInfo(MachineBasicBlock &MBB, BranchInfo &Info);
+  bool getBranchInfo(MachineBasicBlock &MBB, BranchInfo &Info) const;
   void removeBranchPseudos(MachineBasicBlock &MBB);
   void processLoop(MachineLoop *L);
   bool processAllConditionals(MachineFunction &MF);
   Register findScratchGPR(MachineBasicBlock &MBB,
                           Register Avoid0 = Register(),
                           Register Avoid1 = Register()) const;
+  Register findScratchGPRInRegion(ArrayRef<MachineBasicBlock *> Blocks,
+                                  Register Avoid0 = Register(),
+                                  Register Avoid1 = Register()) const;
+  bool clobbersFlag(MachineBasicBlock &MBB, unsigned FReg) const;
 
   void processDiamond(MachineFunction &MF, MachineBasicBlock &CondBB,
                       MachineBasicBlock *TrueBB, MachineBasicBlock *FalseBB,
@@ -143,7 +149,7 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_END(GPUControlFlow, "gpu-control-flow",
                     "GPU Control Flow Lowering", false, false)
 
-bool GPUControlFlow::getBranchInfo(MachineBasicBlock &MBB, BranchInfo &Info) {
+bool GPUControlFlow::getBranchInfo(MachineBasicBlock &MBB, BranchInfo &Info) const {
   Info = BranchInfo();
 
   for (auto It = MBB.end(); It != MBB.begin();) {
@@ -214,6 +220,119 @@ Register GPUControlFlow::findScratchGPR(MachineBasicBlock &MBB,
   }
 
   return Register();
+}
+
+Register GPUControlFlow::findScratchGPRInRegion(ArrayRef<MachineBasicBlock *> Blocks,
+                                                Register Avoid0,
+                                                Register Avoid1) const {
+  static const MCPhysReg Candidates[] = {
+      GPU::R29, GPU::R28, GPU::R27, GPU::R26, GPU::R25, GPU::R24, GPU::R23,
+      GPU::R22, GPU::R21, GPU::R20, GPU::R19, GPU::R18, GPU::R17, GPU::R16,
+      GPU::R15, GPU::R14, GPU::R13, GPU::R12, GPU::R11, GPU::R10, GPU::R9,
+      GPU::R8,  GPU::R7,  GPU::R6,  GPU::R5,  GPU::R4,  GPU::R3,  GPU::R2,
+      GPU::R1,  GPU::R31};
+
+  if (Blocks.empty())
+    return Register();
+
+  const TargetRegisterInfo *TRI =
+      Blocks.front()->getParent()->getSubtarget().getRegisterInfo();
+
+  for (MCPhysReg Reg : Candidates) {
+    bool Busy = false;
+
+    if (Reg == Avoid0 || Reg == Avoid1)
+      continue;
+
+    for (size_t BlockIndex = 0; BlockIndex < Blocks.size(); ++BlockIndex) {
+      MachineBasicBlock *MBB = Blocks[BlockIndex];
+      for (const auto &LiveOutReg : MBB->liveouts()) {
+        if (TRI->regsOverlap(Reg, LiveOutReg.PhysReg)) {
+          Busy = true;
+          break;
+        }
+      }
+      if (Busy)
+        break;
+
+      bool ScanOperands = (BlockIndex > 0);
+      if (ScanOperands) {
+        for (const MachineInstr &MI : *MBB) {
+          for (const MachineOperand &MO : MI.operands()) {
+            if (!MO.isReg())
+              continue;
+            Register OpReg = MO.getReg();
+            if (!OpReg.isPhysical())
+              continue;
+            if (TRI->regsOverlap(Reg, OpReg)) {
+              Busy = true;
+              break;
+            }
+          }
+          if (Busy)
+            break;
+        }
+      }
+      if (Busy)
+        break;
+    }
+
+    if (!Busy)
+      return Reg;
+  }
+
+  return Register();
+}
+
+bool GPUControlFlow::clobbersFlag(MachineBasicBlock &MBB, unsigned FReg) const {
+  const Register Flag = flagReg(FReg);
+  auto ScanBegin = MBB.begin();
+
+  auto IsStructuredCF = [](unsigned Opc) {
+    switch (Opc) {
+    case GPU::GOTO_INST:
+    case GPU::JOIN_INST:
+    case GPU::WHILE_INST:
+    case GPU::BREAK_INST:
+    case GPU::JUMP_INST:
+      return true;
+    default:
+      return false;
+    }
+  };
+
+  for (auto It = MBB.begin(), End = MBB.end(); It != End; ++It) {
+    if (It->isDebugInstr())
+      continue;
+    if (IsStructuredCF(It->getOpcode()))
+      ScanBegin = std::next(It);
+  }
+
+  for (auto It = ScanBegin, End = MBB.end(); It != End; ++It) {
+    const MachineInstr &MI = *It;
+    if (MI.isDebugInstr())
+      continue;
+
+    if (MI.getOpcode() != GPU::CMPrr && MI.getOpcode() != GPU::CMPri)
+      continue;
+
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isDef())
+        continue;
+
+      Register Reg = MO.getReg();
+      if (Reg == Flag)
+        return true;
+    }
+
+    if (MI.getNumOperands()) {
+      const MachineOperand &FlagOp = MI.getOperand(MI.getNumOperands() - 1);
+      if (FlagOp.isImm() && static_cast<unsigned>(FlagOp.getImm()) == FReg)
+        return true;
+    }
+  }
+
+  return false;
 }
 
 void GPUControlFlow::processLoop(MachineLoop *L) {
@@ -521,6 +640,8 @@ void GPUControlFlow::processDiamond(MachineFunction &MF,
                                     MachineBasicBlock *FalseBB,
                                     MachineBasicBlock *MergeBB,
                                     unsigned FReg) {
+  constexpr unsigned CondEq = 0;
+
   ensureAfter(MF, &CondBB, TrueBB);
   ensureAfter(MF, TrueBB, FalseBB);
   if (MergeBB)
@@ -529,6 +650,26 @@ void GPUControlFlow::processDiamond(MachineFunction &MF,
   removeBranchPseudos(CondBB);
   removeBranchPseudos(*TrueBB);
   removeBranchPseudos(*FalseBB);
+
+  const bool PreserveOuterCond = clobbersFlag(*TrueBB, FReg);
+  unsigned SavedFReg = (FReg + 1) & 3;
+  Register SavedMaskReg;
+  if (PreserveOuterCond) {
+    SmallVector<MachineBasicBlock *, 2> Blocks = {&CondBB, TrueBB};
+    SavedMaskReg = findScratchGPRInRegion(Blocks);
+    if (!SavedMaskReg)
+      report_fatal_error(
+          "GPUControlFlow: no scratch GPR available to preserve diamond "
+          "condition");
+    BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::MOVI))
+        .addReg(SavedMaskReg, RegState::Define)
+        .addImm(1);
+    BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::SELi))
+        .addReg(SavedMaskReg, RegState::Define)
+        .addReg(SavedMaskReg)
+        .addImm(0)
+        .addImm(FReg);
+  }
 
   // GOTO: flag=1 lanes (false-path) get pushed, true-path lanes stay active
   // BRCOND flag=1 branches to TrueBB. For GOTO, we push the "other" lanes.
@@ -541,9 +682,17 @@ void GPUControlFlow::processDiamond(MachineFunction &MF,
   // JOIN at end of TrueBB (reactivate false-path lanes)
   BuildMI(*TrueBB, TrueBB->end(), DebugLoc(), TII->get(GPU::JOIN_INST));
 
+  if (PreserveOuterCond) {
+    BuildMI(*TrueBB, TrueBB->end(), DebugLoc(), TII->get(GPU::CMPri))
+        .addReg(SavedMaskReg)
+        .addImm(1)
+        .addImm(CondEq)
+        .addImm(SavedFReg);
+  }
+
   // GOTO: now push true-path lanes (flag=1), false-path lanes active
   BuildMI(*TrueBB, TrueBB->end(), DebugLoc(), TII->get(GPU::GOTO_INST))
-      .addReg(flagReg(FReg))
+      .addReg(flagReg(PreserveOuterCond ? SavedFReg : FReg))
       .addImm(1)   // PRED_IF: push flag=1 (true) lanes, false lanes active
       .addImm(0);
 
@@ -643,6 +792,8 @@ void GPUControlFlow::processSplit(MachineFunction &MF,
                                   MachineBasicBlock *TrueBB,
                                   MachineBasicBlock *FalseBB,
                                   unsigned FReg) {
+  constexpr unsigned CondEq = 0;
+
   ensureAfter(MF, &CondBB, TrueBB);
   ensureAfter(MF, TrueBB, FalseBB);
 
@@ -652,6 +803,26 @@ void GPUControlFlow::processSplit(MachineFunction &MF,
   removeBranchPseudos(*TrueBB);
   removeBranchPseudos(*FalseBB);
 
+  const bool PreserveOuterCond = clobbersFlag(*TrueBB, FReg);
+  unsigned SavedFReg = (FReg + 1) & 3;
+  Register SavedMaskReg;
+  if (PreserveOuterCond) {
+    SmallVector<MachineBasicBlock *, 2> Blocks = {&CondBB, TrueBB};
+    SavedMaskReg = findScratchGPRInRegion(Blocks);
+    if (!SavedMaskReg)
+      report_fatal_error(
+          "GPUControlFlow: no scratch GPR available to preserve split "
+          "condition");
+    BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::MOVI))
+        .addReg(SavedMaskReg, RegState::Define)
+        .addImm(1);
+    BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::SELi))
+        .addReg(SavedMaskReg, RegState::Define)
+        .addReg(SavedMaskReg)
+        .addImm(0)
+        .addImm(FReg);
+  }
+
   // Same as diamond but no merge point
   BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::GOTO_INST))
       .addReg(flagReg(FReg))
@@ -660,8 +831,16 @@ void GPUControlFlow::processSplit(MachineFunction &MF,
 
   BuildMI(*TrueBB, TrueBB->end(), DebugLoc(), TII->get(GPU::JOIN_INST));
 
+  if (PreserveOuterCond) {
+    BuildMI(*TrueBB, TrueBB->end(), DebugLoc(), TII->get(GPU::CMPri))
+        .addReg(SavedMaskReg)
+        .addImm(1)
+        .addImm(CondEq)
+        .addImm(SavedFReg);
+  }
+
   BuildMI(*TrueBB, TrueBB->end(), DebugLoc(), TII->get(GPU::GOTO_INST))
-      .addReg(flagReg(FReg))
+      .addReg(flagReg(PreserveOuterCond ? SavedFReg : FReg))
       .addImm(1)   // PRED_IF
       .addImm(0);
 
@@ -683,12 +862,20 @@ void GPUControlFlow::processSplit(MachineFunction &MF,
 
 bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
   bool Changed = false;
-  bool Progress = true;
+  auto scanConditionals = [&](bool Reverse) -> bool {
+    SmallVector<MachineBasicBlock *, 32> Order;
+    Order.reserve(MF.size());
 
-  while (Progress) {
-    Progress = false;
+    if (Reverse) {
+      for (auto It = MF.rbegin(), E = MF.rend(); It != E; ++It)
+        Order.push_back(&*It);
+    } else {
+      for (auto &MBB : MF)
+        Order.push_back(&MBB);
+    }
 
-    for (auto &MBB : MF) {
+    for (MachineBasicBlock *MBBPtr : Order) {
+      MachineBasicBlock &MBB = *MBBPtr;
       BranchInfo Info;
       if (!getBranchInfo(MBB, Info))
         continue;
@@ -697,6 +884,14 @@ bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
           (Info.Invert == 0) ? Info.BranchTarget : Info.Fallthrough;
       MachineBasicBlock *FalsePath =
           (Info.Invert == 0) ? Info.Fallthrough : Info.BranchTarget;
+
+      // Triangle (true body)
+      if (TruePath->succ_size() == 1 &&
+          *TruePath->succ_begin() == FalsePath) {
+        processTriangleTrue(MF, MBB, TruePath, FalsePath, Info.FReg);
+        Changed = true;
+        return true;
+      }
 
       // Diamond: both paths converge
       if (TruePath->succ_size() == 1 && FalsePath->succ_size() == 1 &&
@@ -717,23 +912,12 @@ bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
 
           processTriangleTrue(MF, MBB, TruePath, MergeBB, Info.FReg);
           Changed = true;
-          Progress = true;
-          break;
+          return true;
         }
 
         processDiamond(MF, MBB, TruePath, FalsePath, MergeBB, Info.FReg);
         Changed = true;
-        Progress = true;
-        break;
-      }
-
-      // Triangle (true body)
-      if (TruePath->succ_size() == 1 &&
-          *TruePath->succ_begin() == FalsePath) {
-        processTriangleTrue(MF, MBB, TruePath, FalsePath, Info.FReg);
-        Changed = true;
-        Progress = true;
-        break;
+        return true;
       }
 
       // Triangle (false body)
@@ -741,18 +925,22 @@ bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
           *FalsePath->succ_begin() == TruePath) {
         processTriangleFalse(MF, MBB, FalsePath, TruePath, Info.FReg);
         Changed = true;
-        Progress = true;
-        break;
+        return true;
       }
 
       // Split: both terminate
       if (TruePath->succ_size() == 0 && FalsePath->succ_size() == 0) {
         processSplit(MF, MBB, TruePath, FalsePath, Info.FReg);
         Changed = true;
-        Progress = true;
-        break;
+        return true;
       }
     }
+
+    return false;
+  };
+
+  while (scanConditionals(/*Reverse=*/true) ||
+         scanConditionals(/*Reverse=*/false)) {
   }
 
   return Changed;
