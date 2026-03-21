@@ -6,7 +6,8 @@ explicitly structured and compiler-controlled: `GOTO`, `JOIN`, `WHILE`,
 only an `exec_mask` plus a plain mask stack.
 
 This README owns compiler/backend-specific decisions. The superproject root
-`README` should only carry project-wide state.
+[CLAUDE.md](/home/selimsandal/Developer/gpu/CLAUDE.md) should carry internal
+project-wide state.
 
 ## Current Compute ABI Direction
 
@@ -57,6 +58,68 @@ Still incomplete:
 - full simulator-sync parity for these higher-level surfaces
 - any source-level atomic variants outside the currently verified subset
 - richer reflection beyond the current minimal launch record
+
+## Compilation Pipelines
+
+Working:
+
+- `LLVM IR -> llc -march=gpu -> ELF .o -> gpu_shader_loader.h`
+  - write kernels in LLVM IR with `r1-r4` as arguments
+  - `<=4` args use direct registers
+  - `>4` args use an indirect buffer in `r1`
+  - `r0` remains the physical thread ID for low-level code, but
+    compiler-visible workgroup/system values lower through hidden workgroup
+    context plus `I_GETSR`
+- `OpenCL C -> clang -target spir -> llvm-spirv -> llc -march=gpu`
+  - current compute subset only
+  - `mad()` / `min()` / `max()` lower cleanly
+  - builtin IDs lower through hidden workgroup context / `I_GETSR` with
+    compiler-derived `global_id`
+  - source-level `barrier()` / `mem_fence()` lower to real GPU sync ops
+  - optimized `__local` kernel arguments lower onto the local-memory path
+  - current runtime ABI for `__local` pointer args is a byte offset into
+    per-workgroup local memory, not a DDR pointer
+- `HLSL -> clang -x hlsl -> LLVM IR -> GPUHLSLLowering -> llc -march=gpu`
+  - current compute-only subset
+  - `@llvm.dx.*` system values lower through hidden workgroup context /
+    `I_GETSR` and compiler-derived IDs
+  - resource bindings still map to `r1-r4` (`<=4` direct, `>4` indirect)
+  - `groupshared` globals, `GroupMemoryBarrierWithGroupSync()`, and the
+    verified `groupshared` `Interlocked*` subset compile on this path
+
+Blocked:
+
+- DXC and Slang both produce Vulkan SPIR-V, which the current
+  SPIRV-LLVM-Translator path cannot ingest
+- Slang's `llvm-shader-ir` target emits host-style x86 IR with explicit thread
+  loops, not GPU shader IR
+
+## External Tools
+
+| Tool | Location | Use |
+|------|----------|-----|
+| DXC | In `PATH` (`dxc`) | HLSL -> SPIR-V (Vulkan, currently blocked by the translator) |
+| Slang | In `PATH` (`slangc`) | Slang -> SPIR-V (same Vulkan issue) or host-style LLVM IR |
+| llvm-spirv | not yet built | SPIR-V <-> LLVM IR (OpenCL SPIR-V only) |
+| llc | `External/llvm-project/build/bin/llc` | LLVM IR -> GPU asm / obj |
+| gpu-compiler | `External/llvm-project/build/bin/gpu-compiler` | standalone LLVM IR -> GPU ELF compiler |
+
+## Key Backend Files
+
+| File | Purpose |
+|------|---------|
+| `GPUISelLowering.cpp` | DAG lowering: `BR_CC` -> `CMP+BRCOND`, `SELECT_CC` -> `CMP+SEL`, f32/i32 ops |
+| `GPUISelDAGToDAG.cpp` | DAG -> MI selection: `CMP`, `SEL`, `BRCOND`, `BR`, `MOVI`, `RETURN` |
+| `GPUInstrInfo.td` | instruction definitions, patterns, and pseudos such as `GPU_BRCOND`, `GPU_BR`, `LOOP_EXIT_MOVI`, `SELi` |
+| `GPUInstrFormats.td` | 128-bit instruction encoding format matching `make_instr128()` |
+| `GPUTargetMachine.cpp` | pre-ISel pipeline setup, target pass pipeline, and metadata emission placement |
+| `GPUControlFlow.cpp` | post-RA structured control-flow lowering |
+| `GPUPeephole.cpp` | post-RA local combines and final branch/BREAK patching |
+| `GPUMCCodeEmitter.cpp` | 128-bit binary encoding |
+| `GPUMCInstLower.cpp` | MI -> MCInst with source modifier flags |
+| `GPUSPIRVLowering.cpp` | OpenCL/SPIR-V builtin lowering onto raw workgroup state + compiler-derived IDs |
+| `GPUHLSLLowering.cpp` | HLSL lowering: system values, resources, wave ops, barriers, and `groupshared` intrinsics |
+| `GPUKernelMetadata.cpp` | `.gpu.meta` section emission |
 
 ## Current Review Notes
 
@@ -189,7 +252,7 @@ authoritative place to change that is the LLVM submodule.
 - `llvm/lib/Target/GPU/README.md`
   - updated to reflect the current backend ABI and source-level status
   - reason: reviewers need the local compiler contract documented next to the
-    backend, not inferred from the superproject root README
+    backend, not inferred from the superproject root `CLAUDE.md`
 
 ### Test Additions And Why They Exist
 
@@ -236,6 +299,50 @@ loading, reflected descriptor build, and execution.
   - reason: the backend currently prefers a branchless select form for that
     simple triangle instead of forcing a `goto/join` pair
 
+## Validation Surface
+
+Current GPU lit suite (`30` tests):
+
+- `alu.ll`
+- `atomic.ll`
+- `branch-direction.ll`
+- `control-flow-comprehensive.ll`
+- `control-flow.ll`
+- `float.ll`
+- `hlsl-groupshared-sync.ll`
+- `hlsl-local-atomics.ll`
+- `hlsl-math.ll`
+- `hlsl-thread-ids.ll`
+- `hlsl-vec-add.ll`
+- `hlsl-wave-reduce.ll`
+- `local-atomic.ll`
+- `local-memory.ll`
+- `loop-break-divergent.ll`
+- `loop.ll`
+- `memory.ll`
+- `movi-fold.ll`
+- `opencl-local-arg-o0.ll`
+- `opencl-local-arg.ll`
+- `opencl-local-atomic-builtins.ll`
+- `opencl-sync-builtins.ll`
+- `opencl-workgroup-builtins.ll`
+- `reduce.ll`
+- `select.ll`
+- `signed-int-compare.ll`
+- `source-modifiers.ll`
+- `spill.ll`
+- `sync.ll`
+- `uitof-ftou.ll`
+
+Useful superproject host-side checks alongside the LLVM lit suite:
+
+- `Source/Host/Tests/compiler_verify.c`
+- `Source/Host/Tests/gpu_sim_test.c`
+- `Source/Host/Tests/break_color_test.c`
+- `Source/Host/Tests/rejection_loop_test.c`
+- `Source/Host/Tests/gpu_hw_test.c`
+- `Source/Host/PathTracer/pathtracer_compare.c`
+
 ## Pipeline
 
 1. IR is cleaned up before ISel in `GPUTargetMachine.cpp` with
@@ -263,6 +370,47 @@ directly in the instruction.
 
 This keeps the hardware simple and pushes all loop-targeting policy into the
 compiler.
+
+## Peephole Optimizations
+
+- FMA formation:
+  `FMUL(t,a,b) + FADD(d,t,c) -> FMA(d,a,b,c)` when `t` is single-use and
+  multiply operands are not clobbered before the add
+- immediate folding:
+  `MOVI(t,imm) + ALU(d,x,t) -> ALUi(d,x,imm)` for the supported ALU ops, with
+  a multiple-definition guard to avoid folding across divergent control-flow
+  shapes
+- source modifier folding:
+  `FSUB(MOVI(0),x) -> NEG` and `ANDi(x,0x7FFFFFFF) -> ABS`
+
+## Current Limitations
+
+Compiler/runtime gaps that still matter:
+
+- source-level atomic variants outside the currently verified subset
+- richer reflection/runtime metadata beyond the current minimal `.gpu.meta`
+  launch record
+- full simulator memory-model fidelity beyond the current one-workgroup
+  barrier-rendezvous subset
+
+Target/backend gaps that still need implementation:
+
+- descriptor-relative `LDV` / `STV` ISel patterns for vertex/fragment flows
+- `PIXEL_OUT` lowering from LLVM IR
+- full vertex/fragment shader calling conventions and resource mapping
+
+External-tool limitations:
+
+- DXC and Slang produce Vulkan SPIR-V, which the current translator path
+  rejects (`OpTypeForwardPointer`, `GLSL.std.450`,
+  `SPV_KHR_storage_buffer_storage_class`)
+- Slang `llvm-shader-ir` is host-style looped IR, not GPU shader IR
+
+Hardware limitations that still surface at the backend boundary:
+
+- no integer division (`SDIV` / `UDIV` expand to libcalls)
+- no `FSQRT`, `FSIN`, `FCOS`, or `FPOW`
+- `HALT` terminates all lanes, not individual lanes
 
 ## Debugging
 
