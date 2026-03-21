@@ -30,6 +30,7 @@
 #include "GPURegisterInfo.h"
 #include "MCTargetDesc/GPUMCTargetDesc.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -41,6 +42,7 @@
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -87,22 +89,47 @@ private:
                                   Register Avoid0 = Register(),
                                   Register Avoid1 = Register()) const;
   bool clobbersFlag(MachineBasicBlock &MBB, unsigned FReg) const;
+  bool clobbersFlag(ArrayRef<MachineBasicBlock *> Blocks, unsigned FReg) const;
+  MachineBasicBlock *
+  findLinearChainMerge(MachineBasicBlock *Head,
+                       SmallVectorImpl<MachineBasicBlock *> &Blocks) const;
 
   void processDiamond(MachineFunction &MF, MachineBasicBlock &CondBB,
                       MachineBasicBlock *TrueBB, MachineBasicBlock *FalseBB,
                       MachineBasicBlock *MergeBB, unsigned FReg);
+  void processDiamondChain(MachineFunction &MF, MachineBasicBlock &CondBB,
+                           ArrayRef<MachineBasicBlock *> TrueBlocks,
+                           ArrayRef<MachineBasicBlock *> FalseBlocks,
+                           MachineBasicBlock *MergeBB, unsigned FReg);
 
   void processTriangleTrue(MachineFunction &MF, MachineBasicBlock &CondBB,
                            MachineBasicBlock *ThenBB,
                            MachineBasicBlock *MergeBB, unsigned FReg);
+  void processTriangleTrueChain(MachineFunction &MF,
+                                MachineBasicBlock &CondBB,
+                                ArrayRef<MachineBasicBlock *> ThenBlocks,
+                                MachineBasicBlock *MergeBB,
+                                unsigned FReg);
 
   void processTriangleFalse(MachineFunction &MF, MachineBasicBlock &CondBB,
                             MachineBasicBlock *ThenBB,
                             MachineBasicBlock *MergeBB, unsigned FReg);
+  void processTriangleFalseChain(MachineFunction &MF,
+                                 MachineBasicBlock &CondBB,
+                                 ArrayRef<MachineBasicBlock *> ThenBlocks,
+                                 MachineBasicBlock *MergeBB,
+                                 unsigned FReg);
 
   void processSplit(MachineFunction &MF, MachineBasicBlock &CondBB,
                     MachineBasicBlock *TrueBB, MachineBasicBlock *FalseBB,
                     unsigned FReg);
+  void processGuardToMerge(MachineFunction &MF, MachineBasicBlock &CondBB,
+                           MachineBasicBlock *BodyBB,
+                           MachineBasicBlock *MergeBB, unsigned FReg,
+                           bool MergeIsTarget, unsigned Invert);
+  bool lowerResidualLinearConditional(MachineFunction &MF,
+                                      MachineBasicBlock &CondBB);
+  bool lowerResidualGuard(MachineFunction &MF, MachineBasicBlock &CondBB);
 
   bool unTailMergeHALTs(MachineFunction &MF);
   void mergeLinearChain(MachineBasicBlock &Head);
@@ -547,6 +574,15 @@ static void ensureAfter(MachineFunction &MF, MachineBasicBlock *Anchor,
     MF.splice(After, A->getIterator());
 }
 
+static void ensureChainAfter(MachineFunction &MF, MachineBasicBlock *Anchor,
+                             ArrayRef<MachineBasicBlock *> Chain) {
+  MachineBasicBlock *Prev = Anchor;
+  for (MachineBasicBlock *BB : Chain) {
+    ensureAfter(MF, Prev, BB);
+    Prev = BB;
+  }
+}
+
 static void removeHALTs(MachineBasicBlock &MBB) {
   auto I = MBB.end();
   while (I != MBB.begin()) {
@@ -558,6 +594,43 @@ static void removeHALTs(MachineBasicBlock &MBB) {
       break;
     }
   }
+}
+
+static bool dedupSuccessors(MachineBasicBlock &MBB) {
+  SmallVector<MachineBasicBlock *, 4> UniqueSuccs;
+  bool Changed = false;
+
+  for (MachineBasicBlock *Succ : MBB.successors()) {
+    bool Seen = false;
+    for (MachineBasicBlock *Existing : UniqueSuccs) {
+      if (Existing == Succ) {
+        Seen = true;
+        break;
+      }
+    }
+    if (!Seen) {
+      UniqueSuccs.push_back(Succ);
+      continue;
+    }
+    Changed = true;
+  }
+
+  if (!Changed)
+    return false;
+
+  while (!MBB.succ_empty())
+    MBB.removeSuccessor(MBB.succ_begin());
+  for (MachineBasicBlock *Succ : UniqueSuccs)
+    MBB.addSuccessor(Succ);
+
+  return true;
+}
+
+static bool dedupAllSuccessors(MachineFunction &MF) {
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF)
+    Changed |= dedupSuccessors(MBB);
+  return Changed;
 }
 
 bool GPUControlFlow::unTailMergeHALTs(MachineFunction &MF) {
@@ -604,6 +677,40 @@ bool GPUControlFlow::unTailMergeHALTs(MachineFunction &MF) {
   }
 
   return Changed;
+}
+
+bool GPUControlFlow::clobbersFlag(ArrayRef<MachineBasicBlock *> Blocks,
+                                  unsigned FReg) const {
+  for (MachineBasicBlock *BB : Blocks)
+    if (clobbersFlag(*BB, FReg))
+      return true;
+  return false;
+}
+
+MachineBasicBlock *GPUControlFlow::findLinearChainMerge(
+    MachineBasicBlock *Head,
+    SmallVectorImpl<MachineBasicBlock *> &Blocks) const {
+  Blocks.clear();
+  if (!Head)
+    return nullptr;
+
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  MachineBasicBlock *Cur = Head;
+
+  while (true) {
+    if (!Seen.insert(Cur).second)
+      return nullptr;
+    Blocks.push_back(Cur);
+
+    if (Cur->succ_size() != 1)
+      return nullptr;
+
+    MachineBasicBlock *Next = *Cur->succ_begin();
+    if (Next->pred_size() != 1)
+      return Next;
+
+    Cur = Next;
+  }
 }
 
 void GPUControlFlow::mergeLinearChain(MachineBasicBlock &Head) {
@@ -716,6 +823,91 @@ void GPUControlFlow::processDiamond(MachineFunction &MF,
   mergeLinearChain(CondBB);
 }
 
+void GPUControlFlow::processDiamondChain(
+    MachineFunction &MF, MachineBasicBlock &CondBB,
+    ArrayRef<MachineBasicBlock *> TrueBlocks,
+    ArrayRef<MachineBasicBlock *> FalseBlocks,
+    MachineBasicBlock *MergeBB, unsigned FReg) {
+  constexpr unsigned CondEq = 0;
+
+  assert(!TrueBlocks.empty() && !FalseBlocks.empty() &&
+         "diamond chains require non-empty regions");
+
+  MachineBasicBlock *TrueHead = TrueBlocks.front();
+  MachineBasicBlock *TrueTail = TrueBlocks.back();
+  MachineBasicBlock *FalseHead = FalseBlocks.front();
+  MachineBasicBlock *FalseTail = FalseBlocks.back();
+
+  ensureChainAfter(MF, &CondBB, TrueBlocks);
+  ensureChainAfter(MF, TrueTail, FalseBlocks);
+  if (MergeBB)
+    ensureAfter(MF, FalseTail, MergeBB);
+
+  removeBranchPseudos(CondBB);
+  removeBranchPseudos(*TrueTail);
+  removeBranchPseudos(*FalseTail);
+
+  const bool PreserveOuterCond = clobbersFlag(TrueBlocks, FReg);
+  unsigned SavedFReg = (FReg + 1) & 3;
+  Register SavedMaskReg;
+  if (PreserveOuterCond) {
+    SmallVector<MachineBasicBlock *, 8> Blocks;
+    Blocks.push_back(&CondBB);
+    for (MachineBasicBlock *BB : TrueBlocks)
+      Blocks.push_back(BB);
+    SavedMaskReg = findScratchGPRInRegion(Blocks);
+    if (!SavedMaskReg)
+      report_fatal_error(
+          "GPUControlFlow: no scratch GPR available to preserve diamond "
+          "condition");
+    BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::MOVI))
+        .addReg(SavedMaskReg, RegState::Define)
+        .addImm(1);
+    BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::SELi))
+        .addReg(SavedMaskReg, RegState::Define)
+        .addReg(SavedMaskReg)
+        .addImm(0)
+        .addImm(FReg);
+  }
+
+  BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::GOTO_INST))
+      .addReg(flagReg(FReg))
+      .addImm(2)
+      .addImm(0);
+
+  BuildMI(*TrueTail, TrueTail->end(), DebugLoc(), TII->get(GPU::JOIN_INST));
+
+  if (PreserveOuterCond) {
+    BuildMI(*TrueTail, TrueTail->end(), DebugLoc(), TII->get(GPU::CMPri))
+        .addReg(SavedMaskReg)
+        .addImm(1)
+        .addImm(CondEq)
+        .addImm(SavedFReg);
+  }
+
+  BuildMI(*TrueTail, TrueTail->end(), DebugLoc(), TII->get(GPU::GOTO_INST))
+      .addReg(flagReg(PreserveOuterCond ? SavedFReg : FReg))
+      .addImm(1)
+      .addImm(0);
+
+  BuildMI(*FalseTail, FalseTail->end(), DebugLoc(), TII->get(GPU::JOIN_INST));
+
+  while (!CondBB.succ_empty())
+    CondBB.removeSuccessor(CondBB.succ_begin());
+  CondBB.addSuccessor(TrueHead);
+
+  while (!TrueTail->succ_empty())
+    TrueTail->removeSuccessor(TrueTail->succ_begin());
+  TrueTail->addSuccessor(FalseHead);
+
+  while (!FalseTail->succ_empty())
+    FalseTail->removeSuccessor(FalseTail->succ_begin());
+  if (MergeBB)
+    FalseTail->addSuccessor(MergeBB);
+
+  mergeLinearChain(CondBB);
+}
+
 // Triangle (true body): flag=1 → execute ThenBB, flag=0 → skip
 //   GOTO(~flag, merge) → push flag=0 lanes, true lanes active
 //   ... then body ...
@@ -751,6 +943,39 @@ void GPUControlFlow::processTriangleTrue(MachineFunction &MF,
   mergeLinearChain(CondBB);
 }
 
+void GPUControlFlow::processTriangleTrueChain(
+    MachineFunction &MF, MachineBasicBlock &CondBB,
+    ArrayRef<MachineBasicBlock *> ThenBlocks, MachineBasicBlock *MergeBB,
+    unsigned FReg) {
+  assert(!ThenBlocks.empty() && "triangle chain requires non-empty body");
+
+  MachineBasicBlock *ThenHead = ThenBlocks.front();
+  MachineBasicBlock *ThenTail = ThenBlocks.back();
+
+  ensureChainAfter(MF, &CondBB, ThenBlocks);
+  ensureAfter(MF, ThenTail, MergeBB);
+
+  removeBranchPseudos(CondBB);
+  removeBranchPseudos(*ThenTail);
+
+  BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::GOTO_INST))
+      .addReg(flagReg(FReg))
+      .addImm(2)
+      .addImm(0);
+
+  BuildMI(*ThenTail, ThenTail->end(), DebugLoc(), TII->get(GPU::JOIN_INST));
+
+  while (!CondBB.succ_empty())
+    CondBB.removeSuccessor(CondBB.succ_begin());
+  CondBB.addSuccessor(ThenHead);
+
+  while (!ThenTail->succ_empty())
+    ThenTail->removeSuccessor(ThenTail->succ_begin());
+  ThenTail->addSuccessor(MergeBB);
+
+  mergeLinearChain(CondBB);
+}
+
 // Triangle (false body): flag=0 → execute ThenBB, flag=1 → skip
 //   GOTO(flag, merge) → push flag=1 lanes, flag=0 lanes active
 //   ... body ...
@@ -782,6 +1007,39 @@ void GPUControlFlow::processTriangleFalse(MachineFunction &MF,
   while (!ThenBB->succ_empty())
     ThenBB->removeSuccessor(ThenBB->succ_begin());
   ThenBB->addSuccessor(MergeBB);
+
+  mergeLinearChain(CondBB);
+}
+
+void GPUControlFlow::processTriangleFalseChain(
+    MachineFunction &MF, MachineBasicBlock &CondBB,
+    ArrayRef<MachineBasicBlock *> ThenBlocks, MachineBasicBlock *MergeBB,
+    unsigned FReg) {
+  assert(!ThenBlocks.empty() && "triangle chain requires non-empty body");
+
+  MachineBasicBlock *ThenHead = ThenBlocks.front();
+  MachineBasicBlock *ThenTail = ThenBlocks.back();
+
+  ensureChainAfter(MF, &CondBB, ThenBlocks);
+  ensureAfter(MF, ThenTail, MergeBB);
+
+  removeBranchPseudos(CondBB);
+  removeBranchPseudos(*ThenTail);
+
+  BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::GOTO_INST))
+      .addReg(flagReg(FReg))
+      .addImm(1)
+      .addImm(0);
+
+  BuildMI(*ThenTail, ThenTail->end(), DebugLoc(), TII->get(GPU::JOIN_INST));
+
+  while (!CondBB.succ_empty())
+    CondBB.removeSuccessor(CondBB.succ_begin());
+  CondBB.addSuccessor(ThenHead);
+
+  while (!ThenTail->succ_empty())
+    ThenTail->removeSuccessor(ThenTail->succ_begin());
+  ThenTail->addSuccessor(MergeBB);
 
   mergeLinearChain(CondBB);
 }
@@ -860,6 +1118,110 @@ void GPUControlFlow::processSplit(MachineFunction &MF,
   mergeLinearChain(CondBB);
 }
 
+void GPUControlFlow::processGuardToMerge(MachineFunction &MF,
+                                         MachineBasicBlock &CondBB,
+                                         MachineBasicBlock *BodyBB,
+                                         MachineBasicBlock *MergeBB,
+                                         unsigned FReg,
+                                         bool MergeIsTarget,
+                                         unsigned Invert) {
+  ensureAfter(MF, &CondBB, BodyBB);
+
+  removeBranchPseudos(CondBB);
+
+  BuildMI(CondBB, CondBB.end(), DebugLoc(), TII->get(GPU::GOTO_INST))
+      .addReg(flagReg(FReg))
+      .addImm(computePredMode(MergeIsTarget, Invert))
+      .addImm(0);
+
+  auto InsertPos = MergeBB->begin();
+  while (InsertPos != MergeBB->end() &&
+         InsertPos->getOpcode() == GPU::JOIN_INST)
+    ++InsertPos;
+  BuildMI(*MergeBB, InsertPos, DebugLoc(), TII->get(GPU::JOIN_INST));
+
+  while (!CondBB.succ_empty())
+    CondBB.removeSuccessor(CondBB.succ_begin());
+  CondBB.addSuccessor(BodyBB);
+}
+
+bool GPUControlFlow::lowerResidualGuard(MachineFunction &MF,
+                                        MachineBasicBlock &CondBB) {
+  BranchInfo Info;
+  if (!getBranchInfo(CondBB, Info))
+    return false;
+
+  MachineBasicBlock *Next = CondBB.getNextNode();
+  if (!Next)
+    return false;
+
+  MachineBasicBlock *BodyBB = nullptr;
+  MachineBasicBlock *MergeBB = nullptr;
+  bool MergeIsTarget = false;
+
+  if (Info.Fallthrough == Next && Info.BranchTarget != Next) {
+    BodyBB = Info.Fallthrough;
+    MergeBB = Info.BranchTarget;
+    MergeIsTarget = true;
+  } else if (Info.BranchTarget == Next && Info.Fallthrough != Next) {
+    BodyBB = Info.BranchTarget;
+    MergeBB = Info.Fallthrough;
+    MergeIsTarget = false;
+  } else {
+    return false;
+  }
+
+  bool MergeAfterBody = false;
+  for (MachineBasicBlock *BB = BodyBB; BB; BB = BB->getNextNode()) {
+    if (BB == MergeBB) {
+      MergeAfterBody = true;
+      break;
+    }
+  }
+  if (!MergeAfterBody)
+    return false;
+
+  processGuardToMerge(MF, CondBB, BodyBB, MergeBB, Info.FReg,
+                      MergeIsTarget, Info.Invert);
+  return true;
+}
+
+bool GPUControlFlow::lowerResidualLinearConditional(
+    MachineFunction &MF, MachineBasicBlock &CondBB) {
+  BranchInfo Info;
+  if (!getBranchInfo(CondBB, Info))
+    return false;
+
+  MachineBasicBlock *TruePath =
+      (Info.Invert == 0) ? Info.BranchTarget : Info.Fallthrough;
+  MachineBasicBlock *FalsePath =
+      (Info.Invert == 0) ? Info.Fallthrough : Info.BranchTarget;
+
+  SmallVector<MachineBasicBlock *, 16> TrueBlocks;
+  SmallVector<MachineBasicBlock *, 16> FalseBlocks;
+  MachineBasicBlock *TrueMerge = findLinearChainMerge(TruePath, TrueBlocks);
+  MachineBasicBlock *FalseMerge = findLinearChainMerge(FalsePath, FalseBlocks);
+
+  if (TrueMerge && TrueMerge == FalsePath) {
+    processTriangleTrueChain(MF, CondBB, TrueBlocks, FalsePath, Info.FReg);
+    return true;
+  }
+
+  if (FalseMerge && FalseMerge == TruePath) {
+    processTriangleFalseChain(MF, CondBB, FalseBlocks, TruePath, Info.FReg);
+    return true;
+  }
+
+  if (TrueMerge && FalseMerge && TrueMerge == FalseMerge &&
+      TrueMerge != TruePath && TrueMerge != FalsePath) {
+    processDiamondChain(MF, CondBB, TrueBlocks, FalseBlocks, TrueMerge,
+                        Info.FReg);
+    return true;
+  }
+
+  return false;
+}
+
 bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
   bool Changed = false;
   auto scanConditionals = [&](bool Reverse) -> bool {
@@ -931,6 +1293,24 @@ bool GPUControlFlow::processAllConditionals(MachineFunction &MF) {
       // Split: both terminate
       if (TruePath->succ_size() == 0 && FalsePath->succ_size() == 0) {
         processSplit(MF, MBB, TruePath, FalsePath, Info.FReg);
+        Changed = true;
+        return true;
+      }
+
+      // Guard: one path exits the function, the other continues through the
+      // rest of the body until a shared final exit block. Park the exit lanes
+      // with a GOTO and reactivate them at the exit block with JOIN.
+      if (TruePath->succ_size() == 0 && FalsePath->succ_size() != 0) {
+        processGuardToMerge(MF, MBB, FalsePath, TruePath, Info.FReg,
+                            /*MergeIsTarget=*/Info.BranchTarget == TruePath,
+                            Info.Invert);
+        Changed = true;
+        return true;
+      }
+      if (FalsePath->succ_size() == 0 && TruePath->succ_size() != 0) {
+        processGuardToMerge(MF, MBB, TruePath, FalsePath, Info.FReg,
+                            /*MergeIsTarget=*/Info.BranchTarget == FalsePath,
+                            Info.Invert);
         Changed = true;
         return true;
       }
@@ -1007,6 +1387,7 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
           .addMBB(Fallthrough);
     }
   }
+  Changed |= dedupAllSuccessors(MF);
 
   // Phase 1: Process loops (WHILE/BREAK/JUMP/JOIN)
   MachineLoopInfo &MLI =
@@ -1026,21 +1407,43 @@ bool GPUControlFlow::runOnMachineFunction(MachineFunction &MF) {
 
   // Phase 3: Un-tail-merge HALTs
   Changed |= unTailMergeHALTs(MF);
+  Changed |= dedupAllSuccessors(MF);
 
   // Phase 4: Convert conditionals to GOTO/JOIN
   Changed |= processAllConditionals(MF);
+  Changed |= dedupAllSuccessors(MF);
 
   // Phase 4b: Remove remaining unconditional branch pseudos anywhere in the
   // block. After loop/conditional lowering they are only CFG bookkeeping, and
   // merged blocks can otherwise leave stale GPU_BR instructions stranded in
   // the middle of a block.
+  bool LoweredResidualGuard = true;
+  while (LoweredResidualGuard) {
+    LoweredResidualGuard = false;
+    for (auto &MBB : MF) {
+      if (lowerResidualLinearConditional(MF, MBB) ||
+          lowerResidualGuard(MF, MBB)) {
+        Changed = true;
+        LoweredResidualGuard = true;
+        break;
+      }
+    }
+    if (LoweredResidualGuard)
+      Changed |= dedupAllSuccessors(MF);
+  }
+
   for (auto &MBB : MF) {
     SmallVector<MachineInstr *, 4> ToErase;
     for (auto &MI : MBB) {
       if (MI.getOpcode() == GPU::GPU_BR)
         ToErase.push_back(&MI);
-      if (MI.getOpcode() == GPU::GPU_BRCOND)
+      if (MI.getOpcode() == GPU::GPU_BRCOND) {
+        errs() << "GPUControlFlow residual GPU_BRCOND in bb." << MBB.getNumber()
+               << ": ";
+        MI.print(errs());
+        errs() << '\n';
         report_fatal_error("GPUControlFlow: unlowered GPU_BRCOND survived conditional lowering");
+      }
     }
     for (auto *MI : ToErase)
       MI->eraseFromParent();
