@@ -57,7 +57,6 @@ Still incomplete:
 
 - full simulator-sync parity for these higher-level surfaces
 - any source-level atomic variants outside the currently verified subset
-- richer reflection beyond the current minimal launch record
 
 ## Compilation Pipelines
 
@@ -87,19 +86,10 @@ Working:
   - `groupshared` globals, `GroupMemoryBarrierWithGroupSync()`, and the
     verified `groupshared` `Interlocked*` subset compile on this path
 
-Blocked:
-
-- DXC and Slang both produce Vulkan SPIR-V, which the current
-  SPIRV-LLVM-Translator path cannot ingest
-- Slang's `llvm-shader-ir` target emits host-style x86 IR with explicit thread
-  loops, not GPU shader IR
-
 ## External Tools
 
 | Tool | Location | Use |
 |------|----------|-----|
-| DXC | In `PATH` (`dxc`) | HLSL -> SPIR-V (Vulkan, currently blocked by the translator) |
-| Slang | In `PATH` (`slangc`) | Slang -> SPIR-V (same Vulkan issue) or host-style LLVM IR |
 | llvm-spirv | not yet built | SPIR-V <-> LLVM IR (OpenCL SPIR-V only) |
 | llc | `External/llvm-project/build/bin/llc` | LLVM IR -> GPU asm / obj |
 | gpu-compiler | `External/llvm-project/build/bin/gpu-compiler` | standalone LLVM IR -> GPU ELF compiler |
@@ -388,23 +378,8 @@ compiler.
 Compiler/runtime gaps that still matter:
 
 - source-level atomic variants outside the currently verified subset
-- richer reflection/runtime metadata beyond the current minimal `.gpu.meta`
-  launch record
-- full simulator memory-model fidelity beyond the current one-workgroup
-  barrier-rendezvous subset
-
-Target/backend gaps that still need implementation:
-
-- descriptor-relative `LDV` / `STV` ISel patterns for vertex/fragment flows
-- `PIXEL_OUT` lowering from LLVM IR
-- full vertex/fragment shader calling conventions and resource mapping
-
-External-tool limitations:
-
-- DXC and Slang produce Vulkan SPIR-V, which the current translator path
-  rejects (`OpTypeForwardPointer`, `GLSL.std.450`,
-  `SPV_KHR_storage_buffer_storage_class`)
-- Slang `llvm-shader-ir` is host-style looped IR, not GPU shader IR
+- full simulator memory-model fidelity beyond the current supported
+  workgroup-local barrier model
 
 Hardware limitations that still surface at the backend boundary:
 
