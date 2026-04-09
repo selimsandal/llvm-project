@@ -78,6 +78,13 @@ static constexpr uint32_t GPUKernelMetaMagic = 0x4D555047u; // "GPUM"
 static constexpr uint16_t GPUKernelMetaVersion = 1u;
 static constexpr uint16_t GPUKernelMetaSizeBytes = 24u;
 
+static uint16_t getKernelArgSlotWidth(const Argument &Arg) {
+  Type *Ty = Arg.getType();
+  if (Ty->isIntegerTy(64))
+    return 2;
+  return 1;
+}
+
 static bool parseUInt16(StringRef Text, uint16_t &Out) {
   unsigned Value = 0;
   if (Text.getAsInteger(10, Value) || Value > 0xFFFFu)
@@ -184,8 +191,12 @@ bool GPUKernelMetadata::collectMetadata(Function &Entry,
     HasMetadata = true;
   }
 
-  Info.ArgCount = static_cast<uint16_t>(Entry.arg_size());
-  if (Entry.arg_size() > 4)
+  {
+    for (Argument &Arg : Entry.args())
+      Info.ArgCount = static_cast<uint16_t>(
+          Info.ArgCount + getKernelArgSlotWidth(Arg));
+  }
+  if (Info.ArgCount > 4)
     Info.Flags |= GPU_META_FLAG_INDIRECT_ARGS;
 
   // Emit the local-arg mask for both the direct (<=4 args) and indirect
@@ -194,12 +205,13 @@ bool GPUKernelMetadata::collectMetadata(Function &Entry,
   // and the compiler is the only place that knows the original kernel
   // address-space metadata. The mask is limited to 32 args.
   {
-    unsigned Index = 0;
+    unsigned SourceIndex = 0;
+    unsigned SlotIndex = 0;
     for (Argument &Arg : Entry.args()) {
-      (void)Arg;
-      if (Index < 32 && getKernelArgAddressSpace(Entry, Index) == 3)
-        Info.DirectLocalArgMask |= (1u << Index);
-      ++Index;
+      if (SlotIndex < 32 && getKernelArgAddressSpace(Entry, SourceIndex) == 3)
+        Info.DirectLocalArgMask |= (1u << SlotIndex);
+      SlotIndex += getKernelArgSlotWidth(Arg);
+      ++SourceIndex;
     }
   }
 
