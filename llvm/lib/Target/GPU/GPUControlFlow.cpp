@@ -596,6 +596,19 @@ static void removeHALTs(MachineBasicBlock &MBB) {
   }
 }
 
+static bool isPureExitBlock(const MachineBasicBlock &MBB) {
+  bool SawHalt = false;
+  for (const MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    if (!MI.isTerminator())
+      return false;
+    if (MI.getOpcode() == GPU::HALT)
+      SawHalt = true;
+  }
+  return SawHalt;
+}
+
 static bool dedupSuccessors(MachineBasicBlock &MBB) {
   SmallVector<MachineBasicBlock *, 4> UniqueSuccs;
   bool Changed = false;
@@ -661,6 +674,36 @@ bool GPUControlFlow::unTailMergeHALTs(MachineFunction &MF) {
       }
       if (!OtherSucc)
         continue;
+
+      bool OtherHasRealWork = false;
+      for (const MachineInstr &MI : *OtherSucc) {
+        if (MI.isDebugInstr())
+          continue;
+        if (!MI.isTerminator()) {
+          OtherHasRealWork = true;
+          break;
+        }
+      }
+      if (OtherHasRealWork) {
+        if (OtherSucc->succ_size() == 1) {
+          MachineBasicBlock *ExitBB = *OtherSucc->succ_begin();
+          if (ExitBB && isPureExitBlock(*ExitBB) &&
+              !Pred->isSuccessor(ExitBB)) {
+            removeBranchPseudos(*OtherSucc);
+            for (const MachineInstr &MI : *ExitBB) {
+              if (MI.isDebugInstr())
+                continue;
+              MachineInstr *Clone = MF.CloneMachineInstr(&MI);
+              OtherSucc->insert(OtherSucc->end(), Clone);
+            }
+            OtherSucc->removeSuccessor(ExitBB);
+            Changed = true;
+            Progress = true;
+            break;
+          }
+        }
+        continue;
+      }
 
       if (!OtherSucc->empty() && OtherSucc->back().getOpcode() == GPU::HALT &&
           OtherSucc->succ_empty() && OtherSucc->pred_size() <= 1)
