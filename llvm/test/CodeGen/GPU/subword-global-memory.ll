@@ -6,8 +6,8 @@
 ; — the GPU only has 32-bit memory ops and there is no pattern for
 ; sub-word loads. The fix is the new `GPUSubwordMemoryLowering` IR
 ; pass, which rewrites every sub-word global load/store into an
-; aligned i32 word load + shift + mask (loads) or read-modify-write
-; (stores). This is what unblocks Rodinia bfs, which uses
+; aligned i32 word load + shift + mask (loads) or an aligned-word
+; cmpxchg loop (stores). This is what unblocks Rodinia bfs, which uses
 ; `__global char* g_graph_mask` for its visited / mask arrays.
 
 target triple = "spir"
@@ -29,7 +29,7 @@ define dso_local spir_kernel void @i8_store(ptr addrspace(1) %p,
                                             ptr addrspace(1) %vp) {
 ; CHECK-LABEL: i8_store:
 ; CHECK:       ld_scatter
-; CHECK:       st_scatter
+; CHECK:       atomic_cas
 ; CHECK:       halt
   %v = load i32, ptr addrspace(1) %vp, align 4
   %t = trunc i32 %v to i8

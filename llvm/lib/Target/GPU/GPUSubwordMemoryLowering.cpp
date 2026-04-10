@@ -12,13 +12,12 @@
 // regular i32 load, shift right by `(addr & 3) * 8`, then mask /
 // sign-extend per the requested extension.
 //
-// Stores are read-modify-write: load the word, clear the byte slot
-// with an AND mask, OR in the new value shifted into place, then
-// write back the word. That sequence is only valid for ordinary
-// non-volatile stores. Atomic or volatile sub-word global stores need
-// stronger semantics than a synthesized load-mask-store can provide,
-// so this pass rejects them explicitly instead of silently
-// miscompiling them.
+// Stores are lowered through a 32-bit cmpxchg loop: load the aligned
+// word, clear the byte slot with an AND mask, OR in the new value
+// shifted into place, then atomically swap the new word into memory.
+// If another lane updated the word first, retry. This keeps the
+// sub-word store semantics correct across lanes while still targeting
+// the existing 32-bit global memory path.
 //
 // addrspace(3) (local memory) is intentionally left alone — the local
 // memory backend has its own LD_LOCAL/ST_LOCAL path and the
@@ -119,12 +118,32 @@ static void rewriteLoad(LoadInst *LI) {
   LI->eraseFromParent();
 }
 
-// Replace a sub-word store with an aligned i32 read-modify-write.
-// NOT atomic across lanes — see file header.
+static AtomicOrdering getCASSuccessOrdering(const StoreInst *SI) {
+  return SI->isAtomic() ? SI->getOrdering() : AtomicOrdering::Monotonic;
+}
+
+static AtomicOrdering getCASFailureOrdering(AtomicOrdering SuccessOrdering) {
+  return AtomicCmpXchgInst::getStrongestFailureOrdering(SuccessOrdering);
+}
+
+// Replace a sub-word store with an aligned i32 cmpxchg loop so stores
+// to different bytes in the same word remain correct across lanes.
 static void rewriteStore(StoreInst *SI) {
-  IRBuilder<> B(SI);
+  BasicBlock *OrigBB = SI->getParent();
+  Function *F = OrigBB->getParent();
+  LLVMContext &Ctx = F->getContext();
   Value *Ptr = SI->getPointerOperand();
   Value *Val = SI->getValueOperand();
+
+  BasicBlock *ContBB =
+      OrigBB->splitBasicBlock(BasicBlock::iterator(SI), "subword.store.cont");
+  OrigBB->getTerminator()->eraseFromParent();
+
+  BasicBlock *LoopBB =
+      BasicBlock::Create(Ctx, "subword.store.cas", F, ContBB);
+  UncondBrInst::Create(LoopBB, OrigBB);
+
+  IRBuilder<> B(LoopBB);
 
   Value *WordPtr;
   Value *ByteOff;
@@ -139,6 +158,9 @@ static void rewriteStore(StoreInst *SI) {
   Value *Shifted = B.CreateShl(FieldMask, BitShift, "subword.field.mask");
   Value *ClearMask = B.CreateNot(Shifted, "subword.clear.mask");
 
+  AtomicOrdering SuccessOrdering = getCASSuccessOrdering(SI);
+  AtomicOrdering FailureOrdering = getCASFailureOrdering(SuccessOrdering);
+
   LoadInst *OldWord = B.CreateAlignedLoad(I32, WordPtr, Align(4),
                                           SI->isVolatile(), "subword.old");
   Value *Cleared = B.CreateAnd(OldWord, ClearMask, "subword.cleared");
@@ -148,10 +170,13 @@ static void rewriteStore(StoreInst *SI) {
   NewVal = B.CreateShl(NewVal, BitShift, "subword.zext.shifted");
 
   Value *NewWord = B.CreateOr(Cleared, NewVal, "subword.new");
-  StoreInst *NewStore = B.CreateAlignedStore(NewWord, WordPtr, Align(4),
-                                             SI->isVolatile());
-  if (SI->isAtomic())
-    NewStore->setAtomic(SI->getOrdering(), SI->getSyncScopeID());
+  AtomicCmpXchgInst *CAS = B.CreateAtomicCmpXchg(
+      WordPtr, OldWord, NewWord, Align(4), SuccessOrdering, FailureOrdering,
+      SI->getSyncScopeID());
+  CAS->setVolatile(SI->isVolatile());
+
+  Value *Success = B.CreateExtractValue(CAS, 1, "subword.cas.success");
+  B.CreateCondBr(Success, ContBB, LoopBB);
 
   SI->eraseFromParent();
 }
