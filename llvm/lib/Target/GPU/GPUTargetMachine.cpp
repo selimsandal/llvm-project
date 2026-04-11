@@ -15,7 +15,10 @@
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Utils.h"
 
 using namespace llvm;
@@ -37,6 +40,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeGPUTarget() {
   initializeGPUSPIRVLoweringPass(PR);
   initializeGPUHLSLLoweringPass(PR);
   initializeGPUKernelMetadataPass(PR);
+  initializeGPUSubwordMemoryLoweringPass(PR);
 }
 
 GPUTargetMachine::GPUTargetMachine(const Target &T, const Triple &TT,
@@ -124,8 +128,31 @@ public:
   void addIRPasses() override {
     addPass(createGPUSPIRVLoweringPass());
     addPass(createGPUHLSLLoweringPass());
+    // Rewrite sub-word (i1/i8/i16) global loads/stores into aligned
+    // i32 word loads + shift/mask. The GPU has only 32-bit memory ops;
+    // without this kernels using `__global char*` (e.g. Rodinia bfs)
+    // crash "Cannot select: load (s8) ... anyext from i8" in ISel.
+    addPass(createGPUSubwordMemoryLoweringPass());
     addPass(createGPULocalMemoryGlobalsPass());
     addPass(createGPUKernelMetadataPass());
+    // GPUSPIRVLowering marked every non-kernel function `alwaysinline`
+    // and set its linkage to `internal`. Run the always-inliner now to
+    // fold helper functions into their kernel callers, and then
+    // GlobalDCE to drop the now-dead helper bodies before ISel sees
+    // them. This is what unblocks helpers with vector or struct return
+    // types (the GPU backend has no calling-convention slot for those).
+    addPass(createAlwaysInlinerLegacyPass());
+    addPass(createGlobalDCEPass());
+    // The GPU backend only models scalar i32/f32 register classes, so
+    // vector ops like OpenCL's `float4` would reach ISel as illegal
+    // types. Scalarize everything at the IR level so the backend never
+    // sees vectors. This turns `float4` arithmetic into four independent
+    // scalar ops (with matching vector loads/stores broken up too) and
+    // is what unblocks benchmarks like Rodinia `hybridsort/mergesort`
+    // whose helpers return `float4`.
+    ScalarizerPassOptions ScalarOpts;
+    ScalarOpts.ScalarizeLoadStore = true;
+    addPass(createScalarizerPass(ScalarOpts));
     // Keep addrspace(3) distinct so local/shared memory reaches target lowering
     // as real local-memory operations instead of being flattened to global.
     // Feed the backend already-structured CFG whenever possible so the late

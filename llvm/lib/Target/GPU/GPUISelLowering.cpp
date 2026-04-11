@@ -34,14 +34,25 @@ GPUTargetLowering::GPUTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i8, Expand);
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i16, Expand);
 
+  // Sub-word loads expand to an aligned i32 load + mask/shift. The GPU has
+  // only 32-bit memory ops; marking these Expand both emits the right code
+  // and prevents DAGCombine from re-merging a legal `load i32 + and 0xff`
+  // pair back into an i8 extload (which, when Promote was requested on a
+  // target with no larger integer type, used to drive the legalizer into a
+  // path that synthesized a BR_CC node and crashed in LowerBR_CC).
   for (MVT VT : MVT::integer_valuetypes()) {
     for (auto ExtType : {ISD::EXTLOAD, ISD::ZEXTLOAD, ISD::SEXTLOAD}) {
       for (auto SmallVT : {MVT::i1, MVT::i8, MVT::i16})
-        setLoadExtAction(ExtType, VT, SmallVT, Promote);
+        setLoadExtAction(ExtType, VT, SmallVT, Expand);
     }
   }
 
-  // No division in hardware
+  // No integer division in hardware. Tell ExpandIRInsts that the target
+  // cannot handle any div/rem width so the generic IR-level expansion
+  // (bit-by-bit shift/subtract from IntegerDivision.cpp) runs before
+  // ISel. Without this, DAG-level Expand falls through to a `__divsi3`
+  // libcall that does not exist on this target and crashes lowering.
+  setMaxDivRemBitWidthSupported(0);
   setOperationAction(ISD::SDIV, MVT::i32, Expand);
   setOperationAction(ISD::UDIV, MVT::i32, Expand);
   setOperationAction(ISD::SREM, MVT::i32, Expand);

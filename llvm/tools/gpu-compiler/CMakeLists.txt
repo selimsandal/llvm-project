@@ -3,6 +3,7 @@ set(LLVM_LINK_COMPONENTS
   GPUCodeGen
   GPUDesc
   GPUInfo
+  IPO
   IRReader
   MC
   Support

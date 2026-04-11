@@ -21,6 +21,7 @@ namespace llvm {
 
 class GPUTargetMachine;
 class FunctionPass;
+class MachineInstr;
 class ModulePass;
 class PassRegistry;
 
@@ -46,6 +47,17 @@ void initializeGPUHLSLLoweringPass(PassRegistry &);
 
 ModulePass *createGPUKernelMetadataPass();
 void initializeGPUKernelMetadataPass(PassRegistry &);
+
+ModulePass *createGPUSubwordMemoryLoweringPass();
+void initializeGPUSubwordMemoryLoweringPass(PassRegistry &);
+
+// Source modifiers are folded late in GPUPeephole and consumed during
+// MC lowering. Register MachineOperands cannot legally carry target flags in
+// this LLVM branch, so keep the packed 2-bit-per-source modifiers in a
+// backend-side side table keyed by MachineInstr.
+void setGPUSourceModifier(const MachineInstr *MI, unsigned SrcIdx,
+                          unsigned Mod);
+unsigned takeGPUSourceModifiers(const MachineInstr *MI);
 
 } // namespace llvm
 

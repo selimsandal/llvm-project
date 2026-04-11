@@ -107,8 +107,9 @@ Working:
 | `GPUPeephole.cpp` | post-RA local combines and final branch/BREAK patching |
 | `GPUMCCodeEmitter.cpp` | 128-bit binary encoding |
 | `GPUMCInstLower.cpp` | MI -> MCInst with source modifier flags |
-| `GPUSPIRVLowering.cpp` | OpenCL/SPIR-V builtin lowering onto raw workgroup state + compiler-derived IDs |
+| `GPUSPIRVLowering.cpp` | OpenCL/SPIR-V builtin lowering onto raw workgroup state + compiler-derived IDs; also marks helper functions `alwaysinline + internal` so vector / aggregate-typed helpers disappear before ISel |
 | `GPUHLSLLowering.cpp` | HLSL lowering: system values, resources, wave ops, barriers, and `groupshared` intrinsics |
+| `GPUSubwordMemoryLowering.cpp` | IR-level rewriter that turns ordinary `addrspace(1)` `i1`/`i8`/`i16` loads/stores into aligned i32 word load + shift/mask (loads) or read-modify-write (stores). Atomic/volatile sub-word global stores are rejected explicitly instead of being mislowered through that RMW path. |
 | `GPUKernelMetadata.cpp` | `.gpu.meta` section emission |
 
 ## Current Review Notes
@@ -153,10 +154,18 @@ authoritative place to change that is the LLVM submodule.
   - stopped flattening local/shared memory into flat global memory
   - now also runs the kernel-metadata emission pass after frontend lowering and
     local-global allocation
+  - now runs `GPUSubwordMemoryLowering` (sub-word global mem rewriter),
+    `AlwaysInlinerLegacyPass` + `GlobalDCE` (folds non-kernel helpers
+    away before ISel — needed for vector-returning helpers like Rodinia
+    `mergesort`'s `sortElem(float4)`), and `Scalarizer` (breaks any
+    remaining vector ops in the kernel body into scalar i32/f32)
   - reason: the backend cannot emit honest `LD_LOCAL` / `ST_LOCAL` /
     `ATOMIC_LOCAL` if local/shared memory is erased before instruction
     selection, and the host cannot stop hand-filling launch metadata unless the
-    object carries a stable reflection record
+    object carries a stable reflection record. The hardware also has only
+    32-bit memory ops and no multi-register return ABI, so any kernel that
+    uses `__global char*` or any helper with vector/aggregate signatures
+    must have those rewritten before ISel.
 
 - `llvm/lib/Target/GPU/GPUInstrInfo.td`
   - added machine instruction definitions for `GETSR`, `LD_LOCAL`, `ST_LOCAL`,
@@ -197,9 +206,39 @@ authoritative place to change that is the LLVM submodule.
   - added lowering for sync builtins and broader atomic builtins
   - added alloca promotion and wrapper-body cloning to deal with the OpenCL
     wrapper/generated-function shape
+  - added math-builtin rewriting for OpenCL `fabs`, `mul24`, `mad24`,
+    `fma` to `llvm.fabs.f32` / plain `mul` / `mul + add` / `llvm.fma.f32`
+    so they reach ISel as ordinary legal IR instead of unhandled libcalls
+    that crash `LowerReturn`
+  - added `markHelpersAlwaysInline` which tags every non-kernel,
+    non-`optnone` helper as `alwaysinline + internal`. Functions with
+    no callers and a calling-convention-incompatible signature
+    (vector / aggregate / i64 / ...) also get internalized so the
+    follow-up GlobalDCE drops them. Functions that look like top-level
+    entry points (CC-compatible signature, no callers — e.g. lit-test
+    `define void @test_*` cases) are left alone so the lit suite
+    survives. Must run before `stripCallingConventions` so the
+    `SPIR_KERNEL` calling convention is still visible.
   - reviewer note: this file now explicitly ignores non-declaration functions
     during builtin classification so real functions are not misidentified and
     deleted just because their names contain builtin substrings
+
+- `llvm/lib/Target/GPU/GPUPeephole.cpp` /
+  `llvm/lib/Target/GPU/GPUMCInstLower.cpp`
+  - source-modifier folding still recognizes
+    `FSUB(MOVI(0),x) -> NEG` and `ANDi(x,0x7FFFFFFF) -> ABS`, but the folded
+    modifier bits are now carried in a backend-side side table keyed by
+    `MachineInstr*` instead of abusing register-operand target flags
+  - reason: this LLVM branch asserts if target flags are attached to a
+    register `MachineOperand`; the side-table path keeps the same final
+    encoding contract without crashing assertion-enabled `llc`
+
+- `llvm/tools/gpu-compiler/CMakeLists.txt`
+  - now links IPO explicitly
+  - reason: the GPU target machine directly calls
+    `createAlwaysInlinerLegacyPass()` and `createGlobalDCEPass()`, so the
+    standalone `gpu-compiler` tool must link the IPO library instead of
+    relying on transitive linkage that happened to work on some hosts
 
 - `llvm/lib/Target/GPU/GPUHLSLLowering.cpp`
   - moved HLSL system values to raw workgroup state + compiler-derived IDs
@@ -221,6 +260,12 @@ authoritative place to change that is the LLVM submodule.
     - fixed local size is only reflected when the frontend declares one
       (`hlsl.numthreads` or OpenCL `reqd_work_group_size`)
     - dynamic OpenCL local size remains a runtime choice
+  - now also emits the `direct_local_arg_mask` for kernels with `>4`
+    args (the indirect-arg path), not just for the direct-register
+    `<=4` path. The host needs this to know which slots in the
+    indirect arg buffer to pack as `__local` byte offsets vs DDR
+    pointers — Rodinia `pathfinder` is the use case (12 args, two
+    `__local int*`).
 
 - `llvm/lib/Target/GPU/GPUControlFlow.cpp`
   - keeps the reverse/forward leaf-first conditional scan and the
@@ -239,8 +284,58 @@ authoritative place to change that is the LLVM submodule.
     perturbed PathTracer register allocation and changed code shape enough to
     create false semantic mismatches in the compare harness
 
+- `llvm/lib/Target/GPU/GPUFrameLowering.cpp`
+  - the spill-stack base prologue used to be `r30 = lane * frame_size +
+    0x00380000`, which gave every concurrently-running workgroup the same
+    DDR region per lane. With four engines all running different
+    workgroups in parallel, lane 5 of engine 0 and lane 5 of engine 1
+    both wrote to the same address.
+  - now the prologue reads `group_id_x/y/z` and `num_groups_x/y` via
+    `GETSR`, computes the linear group id, and partitions the spill
+    region per workgroup:
+    `r30 = (linear_gid * 8 + lane) * frame_size + 0x00380000`. Scratch
+    is r25..r29 + r30, all unused at function entry.
+  - reason: without this, hotspot3D produces `-inf` (and other garbage)
+    when dispatched across multiple engines. With it, the four engines
+    can run independently from a shared DDR spill area without aliasing.
+
+- `llvm/lib/Target/GPU/GPUSubwordMemoryLowering.cpp`
+  - new IR module pass that rewrites every `addrspace(1)` (and
+    `addrspace(0)`) `i1`/`i8`/`i16` load and store into an aligned
+    32-bit word access. Loads become
+    `(load i32 (addr & ~3)) >> ((addr & 3) * 8)` masked to the width;
+    stores become a read-modify-write of the surrounding word.
+  - reason: the GPU only has `LD_SCATTER` / `ST_SCATTER` 32-bit memory
+    ops, so a `__global char*` (Rodinia `bfs`) hits ISel with no
+    pattern. This pass is the simplest thing that gets those kernels
+    through the compiler.
+  - reviewer note: this pass only handles ordinary non-atomic,
+    non-volatile stores. Atomic or volatile sub-word global stores are
+    rejected explicitly because a load-mask-store rewrite would silently
+    miscompile their semantics. addrspace(3) is intentionally left alone
+    because the local-memory backend has its own LD_LOCAL/ST_LOCAL path.
+
+- `llvm/lib/Target/GPU/GPUISelLowering.cpp` / `.h`
+  - lowers `llvm.gpu.getsr` to `GPUISD::GETSR`
+  - adds return-lowering support so return values stay live to `HALT_RET`
+  - changes extload action for i1/i8/i16 from `Promote` to `Expand`,
+    so `load i32 + and 0xff` is not folded back into an i8 extload that
+    the legalizer cannot expand on this target
+  - overrides `shouldReduceLoadWidth` to refuse i1/i8/i16 narrowing —
+    the GPU only has 32-bit loads, so there is no profit in turning a
+    full word load into a sub-word extload
+  - calls `setMaxDivRemBitWidthSupported(0)` so the IR-level
+    `ExpandIRInsts` pass synthesizes the bit-by-bit shift/subtract
+    sequence for `sdiv`/`udiv`/`srem`/`urem` before ISel — the
+    hardware has no integer division and the runtime has no
+    `__divsi3` libcall
+  - reason: special-register reads, sub-word memory shapes, integer
+    division, and the updated test coverage all need proper lowering
+    through the target DAG
+
 - `llvm/lib/Target/GPU/README.md`
-  - updated to reflect the current backend ABI and source-level status
+  - updated to reflect the current backend ABI, IR-pass pipeline,
+    and source-level status
   - reason: reviewers need the local compiler contract documented next to the
     backend, not inferred from the superproject root `CLAUDE.md`
 
@@ -291,7 +386,7 @@ loading, reflected descriptor build, and execution.
 
 ## Validation Surface
 
-Current GPU lit suite (`30` tests):
+Current GPU lit suite (`37` tests):
 
 - `alu.ll`
 - `atomic.ll`
@@ -305,15 +400,23 @@ Current GPU lit suite (`30` tests):
 - `hlsl-thread-ids.ll`
 - `hlsl-vec-add.ll`
 - `hlsl-wave-reduce.ll`
+- `integer-divrem-expand.ll` — variable-divisor `sdiv`/`udiv`/`srem`/`urem`
+  expand via `ExpandIRInsts` instead of a missing libcall
+- `load-mask-subword.ll` — `(load i32) & 0xff` is not converted to an
+  i8 extload, and the same shape works as a `__local` index
 - `local-atomic.ll`
 - `local-memory.ll`
 - `loop-break-divergent.ll`
 - `loop.ll`
 - `memory.ll`
 - `movi-fold.ll`
+- `opencl-fabs-builtin.ll` — OpenCL `fabs(float)` libcall is rewritten
+  to `llvm.fabs.f32` and folded into a FABS source modifier
 - `opencl-local-arg-o0.ll`
 - `opencl-local-arg.ll`
 - `opencl-local-atomic-builtins.ll`
+- `opencl-mul24-builtin.ll` — OpenCL `mul24` / `mad24` libcalls are
+  rewritten to plain mul / mul+add
 - `opencl-sync-builtins.ll`
 - `opencl-workgroup-builtins.ll`
 - `reduce.ll`
@@ -321,8 +424,18 @@ Current GPU lit suite (`30` tests):
 - `signed-int-compare.ll`
 - `source-modifiers.ll`
 - `spill.ll`
+- `subword-global-memory-reject.ll` — atomic/volatile sub-word global
+  stores are rejected instead of being lowered through the ordinary
+  load-mask-store rewrite
+- `subword-global-memory.ll` — `__global char*`/`short*` loads/stores
+  for ordinary non-atomic, non-volatile accesses go through
+  `GPUSubwordMemoryLowering` (aligned i32 word + shift/mask for loads,
+  RMW for stores)
 - `sync.ll`
 - `uitof-ftou.ll`
+- `vector-helper-inline.ll` — non-kernel helpers with vector signatures
+  get inlined + DCE'd before ISel by `markHelpersAlwaysInline` +
+  `AlwaysInlinerLegacyPass` + `Scalarizer` + `GlobalDCE`
 
 Useful superproject host-side checks alongside the LLVM lit suite:
 
@@ -331,17 +444,40 @@ Useful superproject host-side checks alongside the LLVM lit suite:
 - `Source/Host/Tests/break_color_test.c`
 - `Source/Host/Tests/rejection_loop_test.c`
 - `Source/Host/Tests/gpu_hw_test.c`
+- `Source/Host/Tests/Shaders/Benchmarks/build.sh` — compile-only
+  sweep of 8 in-house + 12 unmodified Rodinia OpenCL kernels through
+  the repo backend (`20/20` green)
+- `Source/Host/Tests/Rodinia/run_all.sh` — end-to-end FPGA harness
+  for unmodified Rodinia `vec_add`, `hotspot3D`, `gaussian` (Fan1),
+  and `kmeans`. Each harness dispatches across all four compute
+  engines via separate `OP_DISPATCH_WORKGROUP` commands and verifies
+  bit-exactly against a CPU reference; output also includes
+  Rodinia-style throughput / GFLOP/s / GB/s reporting from the
+  per-engine performance counters.
 - `Source/Host/PathTracer/pathtracer_compare.c`
 
 ## Pipeline
 
-1. IR is cleaned up before ISel in `GPUTargetMachine.cpp` with
-   `FixIrreducible`, `UnifyLoopExits`, and `StructurizeCFG`.
-2. Normal instruction selection lowers scalar LLVM IR to GPU machine
+1. IR-level lowering passes in `GPUTargetMachine::addIRPasses` (in order):
+   `GPUSPIRVLowering` (OpenCL builtin lowering, helper functions tagged
+   `alwaysinline + internal`), `GPUHLSLLowering`, `GPUSubwordMemoryLowering`
+   (`addrspace(1)` i1/i8/i16 ordinary loads/stores → aligned i32 word +
+   shift/mask; atomic/volatile sub-word stores rejected),
+   `GPULocalMemoryGlobalsPass`, `GPUKernelMetadata`, `AlwaysInlinerLegacyPass`
+   + `GlobalDCE` (drops the helper functions whose signatures the GPU
+   calling convention can't carry), `Scalarizer` (breaks any remaining
+   vector ops into scalar i32/f32), then the standard `FixIrreducible`,
+   `UnifyLoopExits`, `StructurizeCFG`, and `SimplifyCFG`.
+2. `GPUFrameLowering::emitPrologue` partitions the DDR spill region per
+   workgroup using the linear group id read from the wg-context special
+   registers, so concurrent workgroups on different engines do not collide.
+3. `ExpandIRInsts` (gated by `setMaxDivRemBitWidthSupported(0)`) expands
+   integer `sdiv`/`udiv`/`srem`/`urem` into bit-by-bit shift/subtract.
+4. Normal instruction selection lowers scalar LLVM IR to GPU machine
    instructions.
-3. `GPUControlFlow.cpp` converts structured machine CFG regions into
+5. `GPUControlFlow.cpp` converts structured machine CFG regions into
    `WHILE/BREAK/JUMP/JOIN` and `GOTO/JOIN`.
-4. `GPUPeephole.cpp` performs late local combines and patches final branch
+6. `GPUPeephole.cpp` performs late local combines and patches final branch
    offsets plus compiler-selected BREAK depths from the final nesting stack.
 
 The important rule is that hardware does not search for loop frames. The
@@ -381,11 +517,24 @@ Compiler/runtime gaps that still matter:
 - full simulator memory-model fidelity beyond the current supported
   workgroup-local barrier model
 
-Hardware limitations that still surface at the backend boundary:
+Hardware limitations and how the backend papers over them:
 
-- no integer division (`SDIV` / `UDIV` expand to libcalls)
-- no `FSQRT`, `FSIN`, `FCOS`, or `FPOW`
-- `HALT` terminates all lanes, not individual lanes
+- no integer division — `setMaxDivRemBitWidthSupported(0)` forces the
+  generic `ExpandIRInsts` IR pass to expand all `sdiv`/`udiv`/`srem`/
+  `urem` into the bit-by-bit shift/subtract sequence from
+  `IntegerDivision.cpp` before ISel.
+- no `FSQRT`, `FSIN`, `FCOS`, `FPOW`, `FEXP`, `FLOG` — kernels that
+  call these still fail. Add polynomial approximations in source.
+- no sub-word loads/stores (`LD_SCATTER` / `ST_SCATTER` are 32-bit) —
+  the `GPUSubwordMemoryLowering` IR pass rewrites every `i1`/`i8`/`i16`
+  load on `addrspace(1)` into an aligned i32 word load + shift/mask,
+  and every sub-word store into a (racy across lanes) read-modify-write.
+- no vector / aggregate calling convention — `GPUSPIRVLowering` marks
+  every non-kernel helper `alwaysinline + internal`, then the IR pass
+  pipeline runs `AlwaysInliner` + `Scalarizer` + `GlobalDCE` so vector
+  helpers like Rodinia mergesort's `sortElem(float4)` disappear before
+  ISel.
+- `HALT` terminates all lanes, not individual lanes.
 
 ## Debugging
 

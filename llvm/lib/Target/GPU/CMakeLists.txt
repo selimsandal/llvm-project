@@ -28,6 +28,7 @@ add_llvm_target(GPUCodeGen
   GPURegisterInfo.cpp
   GPUSPIRVLowering.cpp
   GPUSubtarget.cpp
+  GPUSubwordMemoryLowering.cpp
   GPUTargetMachine.cpp
 
   LINK_COMPONENTS
