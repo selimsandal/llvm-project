@@ -1,7 +1,9 @@
 //===-- GPUMCInstLower.cpp - GPU MachineInstr->MCInst -----===//
 
 #include "GPUMCInstLower.h"
+#include "GPU.h"
 #include "MCTargetDesc/GPUMCTargetDesc.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -9,6 +11,30 @@
 #include "llvm/MC/MCInst.h"
 
 using namespace llvm;
+
+namespace {
+
+DenseMap<const MachineInstr *, unsigned> GPUSourceModifierMap;
+
+} // namespace
+
+void llvm::setGPUSourceModifier(const MachineInstr *MI, unsigned SrcIdx,
+                                unsigned Mod) {
+  assert(SrcIdx < 3 && "unexpected GPU source-modifier operand index");
+  assert((Mod & ~0x3u) == 0 && "GPU source modifier must fit in 2 bits");
+  unsigned Shift = SrcIdx * 2;
+  unsigned &Packed = GPUSourceModifierMap[MI];
+  Packed = (Packed & ~(0x3u << Shift)) | ((Mod & 0x3u) << Shift);
+}
+
+unsigned llvm::takeGPUSourceModifiers(const MachineInstr *MI) {
+  auto It = GPUSourceModifierMap.find(MI);
+  if (It == GPUSourceModifierMap.end())
+    return 0;
+  unsigned Packed = It->second;
+  GPUSourceModifierMap.erase(It);
+  return Packed;
+}
 
 MCOperand GPUMCInstLower::lowerOperand(const MachineOperand &MO) const {
   switch (MO.getType()) {
@@ -48,17 +74,11 @@ static bool isFloatALUOpcode(unsigned Opc) {
 void GPUMCInstLower::lower(const MachineInstr *MI, MCInst &OutMI) const {
   OutMI.setOpcode(MI->getOpcode());
 
-  // For float ALU ops, extract source modifier TargetFlags from register
-  // operands and pack into MCInst flags for the encoder.
+  // For float ALU ops, extract the packed source modifiers recorded by the
+  // peephole pass and hand them to the encoder in MCInst flags.
   // Encoding: flags[1:0] = src0_mod, flags[3:2] = src1_mod
   if (isFloatALUOpcode(MI->getOpcode())) {
-    unsigned Src0Mod = 0, Src1Mod = 0;
-    // src0 is operand index 1, src1 is operand index 2
-    if (MI->getNumOperands() > 1 && MI->getOperand(1).isReg())
-      Src0Mod = MI->getOperand(1).getTargetFlags() & 0x3;
-    if (MI->getNumOperands() > 2 && MI->getOperand(2).isReg())
-      Src1Mod = MI->getOperand(2).getTargetFlags() & 0x3;
-    OutMI.setFlags(Src0Mod | (Src1Mod << 2));
+    OutMI.setFlags(takeGPUSourceModifiers(MI));
   }
 
   for (const MachineOperand &MO : MI->operands()) {

@@ -188,11 +188,16 @@ bool GPUKernelMetadata::collectMetadata(Function &Entry,
   if (Entry.arg_size() > 4)
     Info.Flags |= GPU_META_FLAG_INDIRECT_ARGS;
 
-  if (Entry.arg_size() <= 4) {
+  // Emit the local-arg mask for both the direct (<=4 args) and indirect
+  // (>4 args) paths. The host needs to know which slots in the indirect
+  // arg buffer should be packed as `__local` byte offsets vs DDR pointers,
+  // and the compiler is the only place that knows the original kernel
+  // address-space metadata. The mask is limited to 32 args.
+  {
     unsigned Index = 0;
     for (Argument &Arg : Entry.args()) {
       (void)Arg;
-      if (getKernelArgAddressSpace(Entry, Index) == 3)
+      if (Index < 32 && getKernelArgAddressSpace(Entry, Index) == 3)
         Info.DirectLocalArgMask |= (1u << Index);
       ++Index;
     }

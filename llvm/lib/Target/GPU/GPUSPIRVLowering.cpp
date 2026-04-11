@@ -66,6 +66,7 @@ private:
   bool stripSPIRVMetadata(Module &M);
   bool removeDuplicateKernels(Module &M);
   bool promoteWrapperAllocas(Module &M);
+  bool markHelpersAlwaysInline(Module &M);
 };
 
 char GPUSPIRVLowering::ID = 0;
@@ -509,13 +510,21 @@ bool GPUSPIRVLowering::lowerMathBuiltins(Module &M) {
     // Classify math builtins by name prefix.
     // OpenCL C++ mangles as: _Z3madfff, _Z3minii, _Z3maxff, etc.
     // The suffix encodes argument types (f=float, i=int, j=uint).
-    enum { NONE, MAD, MIN, MAX } Kind = NONE;
-    if (Name.starts_with("_Z3mad") || Name.starts_with("_Z4fmad"))
+    enum { NONE, MAD, MIN, MAX, FABS_KIND, MUL24_KIND, MAD24_KIND }
+        Kind = NONE;
+    if (Name.starts_with("_Z3mad") || Name.starts_with("_Z4fmad") ||
+        Name.starts_with("_Z3fma"))
       Kind = MAD;
     else if (Name.starts_with("_Z3min") || Name.starts_with("_Z4fmin"))
       Kind = MIN;
     else if (Name.starts_with("_Z3max") || Name.starts_with("_Z4fmax"))
       Kind = MAX;
+    else if (Name.starts_with("_Z4fabs"))
+      Kind = FABS_KIND;
+    else if (Name.starts_with("_Z5mul24"))
+      Kind = MUL24_KIND;
+    else if (Name.starts_with("_Z5mad24"))
+      Kind = MAD24_KIND;
 
     if (Kind == NONE)
       continue;
@@ -565,6 +574,30 @@ bool GPUSPIRVLowering::lowerMathBuiltins(Module &M) {
           Result = Builder.CreateCall(Fn,
               {CI->getArgOperand(0), CI->getArgOperand(1)});
         }
+      } else if (Kind == FABS_KIND && CI->arg_size() == 1 && IsFloat) {
+        // OpenCL `fabs(float)` → llvm.fabs.f32. The GPU backend has
+        // ISD::FABS set to Expand, which the LegalizeDAG pass turns into
+        // `and x, 0x7fffffff`, which GPUPeephole then folds into a real
+        // FABS source modifier. Without this rewrite the call remained as
+        // a `_Z4fabsf` libcall and crashed call lowering.
+        Function *Fn = Intrinsic::getOrInsertDeclaration(
+            &M, Intrinsic::fabs, {Builder.getFloatTy()});
+        Result = Builder.CreateCall(Fn, {CI->getArgOperand(0)});
+      } else if (Kind == MUL24_KIND && CI->arg_size() == 2) {
+        // OpenCL `mul24(a, b)` promises only the low 32 bits of the
+        // product of the low 24 bits of each operand. The GPU's `IMUL`
+        // is already a full 32x32→32 multiply, so a plain `mul` gives
+        // the same low 32 bits. Clang emits this as the libcall
+        // `_Z5mul24ii` / `_Z5mul24jj`, which has no backend handler and
+        // crashes call lowering; rewriting to `mul` skips that path.
+        Result = Builder.CreateMul(CI->getArgOperand(0),
+                                   CI->getArgOperand(1));
+      } else if (Kind == MAD24_KIND && CI->arg_size() == 3) {
+        // OpenCL `mad24(a, b, c)` = `mul24(a, b) + c`; same reasoning as
+        // above — plain mul+add gives the specified low-bit result.
+        Value *M = Builder.CreateMul(CI->getArgOperand(0),
+                                     CI->getArgOperand(1));
+        Result = Builder.CreateAdd(M, CI->getArgOperand(2));
       }
 
       if (Result) {
@@ -658,12 +691,92 @@ bool GPUSPIRVLowering::removeDuplicateKernels(Module &M) {
   return Changed;
 }
 
+// Returns true if the type is one the GPU calling convention can carry
+// in r1..r4 / r0 (32-bit scalar integer, 32-bit float, or pointer).
+// Anything else — vectors, aggregates, larger integers — has no
+// argument/return slot in this backend, so a function whose signature
+// uses such a type can never be an entry point.
+static bool isCallingConvCompatibleType(Type *T) {
+  if (T->isVoidTy())
+    return true;
+  if (T->isFloatTy())
+    return true;
+  if (T->isPointerTy())
+    return true;
+  if (auto *IT = dyn_cast<IntegerType>(T))
+    return IT->getBitWidth() <= 32;
+  return false;
+}
+
+static bool hasCallingConvCompatibleSignature(const Function &F) {
+  if (!isCallingConvCompatibleType(F.getReturnType()))
+    return false;
+  for (const Argument &A : F.args())
+    if (!isCallingConvCompatibleType(A.getType()))
+      return false;
+  return true;
+}
+
+// Mark non-kernel HELPER functions `alwaysinline` and give them
+// internal linkage so the later AlwaysInlinerLegacyPass + GlobalDCE
+// fold helper functions completely away. The GPU backend only models
+// scalar i32/f32 and has no calling-convention slot for vector or
+// struct return values, so helpers that return `float4` or similar
+// must disappear before ISel sees them; this is what unblocks
+// Rodinia's hybridsort/mergesort where `sortElem` returns float4.
+//
+// We have to be careful with non-kernel functions that might be
+// real entry points: lit-style `define void @test_add(...)` tests
+// have no callers, and inlining them away would leave the module
+// empty. Distinguish helpers from entry points by checking the
+// signature — if a function uses a type the GPU calling convention
+// cannot pass (vector/aggregate/i64/...) it CAN'T be an entry point,
+// so internalize it even when use_empty(); otherwise leave
+// callerless functions alone so the lit tests survive.
+bool GPUSPIRVLowering::markHelpersAlwaysInline(Module &M) {
+  bool Changed = false;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (F.getCallingConv() == CallingConv::SPIR_KERNEL)
+      continue;
+    // `optnone` is a deliberate `-O0` choice (the IR verifier even
+    // requires it to come paired with `noinline`); leave those alone.
+    if (F.hasFnAttribute(Attribute::OptimizeNone))
+      continue;
+
+    bool CcCompatible = hasCallingConvCompatibleSignature(F);
+    if (CcCompatible && F.use_empty())
+      continue; // looks like a top-level entry point — leave it alone.
+
+    if (F.hasFnAttribute(Attribute::NoInline)) {
+      F.removeFnAttr(Attribute::NoInline);
+      Changed = true;
+    }
+    if (!F.hasFnAttribute(Attribute::AlwaysInline)) {
+      F.addFnAttr(Attribute::AlwaysInline);
+      Changed = true;
+    }
+    if (!F.hasLocalLinkage()) {
+      F.setLinkage(GlobalValue::InternalLinkage);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool GPUSPIRVLowering::runOnModule(Module &M) {
   bool Changed = false;
   Changed |= lowerBuiltinCalls(M);
   Changed |= lowerSyncBuiltins(M);
   Changed |= lowerAtomicBuiltins(M);
   Changed |= lowerMathBuiltins(M);
+  // `markHelpersAlwaysInline` must run BEFORE `stripCallingConventions`
+  // because it identifies kernels by their `SPIR_KERNEL` calling
+  // convention. If we strip that first, every function looks like a
+  // helper and the subsequent GlobalDCE in the target pass pipeline
+  // deletes the kernels too.
+  Changed |= markHelpersAlwaysInline(M);
   Changed |= stripCallingConventions(M);
   Changed |= stripSPIRVMetadata(M);
   Changed |= removeDuplicateKernels(M);

@@ -67,6 +67,23 @@ public:
   bool reduceSelectOfFPConstantLoads(EVT CmpOpVT) const override {
     return false;
   }
+
+  // The GPU has only 32-bit loads. Refuse to narrow a full word load down
+  // to an i8/i16 extload: there is no hardware instruction to select, and
+  // the legalizer's expand path for EXTLOAD hits an assertion on this
+  // target. Keeping the load+AND form means ISel sees a plain i32 load
+  // followed by an AND with the mask, which both match cleanly.
+  bool shouldReduceLoadWidth(
+      SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
+      std::optional<unsigned> ByteOffset = std::nullopt) const override {
+    if (NewVT.isSimple()) {
+      MVT SVT = NewVT.getSimpleVT();
+      if (SVT == MVT::i1 || SVT == MVT::i8 || SVT == MVT::i16)
+        return false;
+    }
+    return TargetLowering::shouldReduceLoadWidth(Load, ExtTy, NewVT,
+                                                 ByteOffset);
+  }
 };
 
 } // namespace llvm

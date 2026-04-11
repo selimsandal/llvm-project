@@ -338,16 +338,10 @@ bool GPUPeephole::foldImmediates(MachineBasicBlock &MBB) {
 
 // Source modifier folding: FSUB(R31, x) -> FNEG pattern, AND(x, 0x7FFFFFFF) -> FABS pattern.
 // When the result feeds a float ALU op as src1, we can fold by
-// changing the ALU src1 to x and emitting with src1_mod bits.
-// Since we can't add mod operands to existing instructions without
-// new TableGen defs, we annotate the MI's operand TargetFlags.
-// The MCCodeEmitter reads these flags and sets src_mod bits.
-//
-// TargetFlags on a register operand:
-//   0 = no modifier
-//   1 = NEG (flip sign bit)
-//   2 = ABS (clear sign bit)
-//   3 = NEGABS (set sign bit)
+// changing the ALU source to x and emitting with src_mod bits.
+// Since we can't add explicit modifier operands without new TableGen defs,
+// keep the folded modifiers in a backend-side side table and let MC lowering
+// pack them into MCInst flags for the encoder.
 //
 // This folds: FSUB(zero, x) + FADD(d, y, t) -> FADD(d, y, x) with src1_mod=1
 static bool isFloatALU(unsigned Opc) {
@@ -425,7 +419,7 @@ bool GPUPeephole::foldSourceModifiers(MachineBasicBlock &MBB) {
 
       // Fold: replace the source register and set target flags
       MI.getOperand(SrcIdx).setReg(RealSrc);
-      MI.getOperand(SrcIdx).setTargetFlags(Mod);
+      setGPUSourceModifier(&MI, SrcIdx - 1, Mod);
       ToErase.push_back(DefMI);
       Changed = true;
     }
