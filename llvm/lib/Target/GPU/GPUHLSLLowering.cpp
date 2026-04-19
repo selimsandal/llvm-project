@@ -1004,25 +1004,13 @@ bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
         break;
       }
       case DX_RSQRT: {
-        // rsqrt(x) = 1.0 / sqrt(x)
-        // GPU has no native sqrt; use Newton-Raphson inverse sqrt:
-        //   y0 = fdiv(1.0, x)          -- rough initial guess
-        //   y1 = y0 * (1.5 - 0.5*x * y0*y0)  -- one NR iteration
-        // This gives ~23-bit accuracy for f32 with the fast FPU.
         Value *X = CI->getArgOperand(0);
         Type *Ty = X->getType();
         Value *One = ConstantFP::get(Ty, 1.0);
-        Value *Half = ConstantFP::get(Ty, 0.5);
-        Value *ThreeHalf = ConstantFP::get(Ty, 1.5);
-        // Initial estimate via reciprocal (FDIV)
-        Value *Y0 = Builder.CreateFDiv(One, X, "rsqrt_recip");
-        // One Newton-Raphson iteration for 1/sqrt(x):
-        //   y1 = y0 * (1.5 - 0.5 * x * y0 * y0)
-        Value *HalfX = Builder.CreateFMul(Half, X);
-        Value *Y0Sq = Builder.CreateFMul(Y0, Y0);
-        Value *HalfXY0Sq = Builder.CreateFMul(HalfX, Y0Sq);
-        Value *Sub = Builder.CreateFSub(ThreeHalf, HalfXY0Sq);
-        Result = Builder.CreateFMul(Y0, Sub, "rsqrt");
+        Function *Sqrt = Intrinsic::getOrInsertDeclaration(
+            M, Intrinsic::sqrt, {Ty});
+        Value *Root = Builder.CreateCall(Sqrt, {X}, "sqrt");
+        Result = Builder.CreateFDiv(One, Root, "rsqrt");
         break;
       }
       case DX_IMAD:

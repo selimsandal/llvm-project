@@ -419,6 +419,11 @@ def FTOU : GPUInstUnary<0x4A,
   "ftou\t$dst, $src0",
   [(set GPR:$dst, (fp_to_uint GPR:$src0))]>;
 
+def FSQRT : GPUInstUnary<0x4B,
+  (outs GPR:$dst), (ins GPR:$src0),
+  "fsqrt\t$dst, $src0",
+  [(set GPR:$dst, (fsqrt GPR:$src0))]>;
+
 } // hasSideEffects = 0, mayLoad = 0, mayStore = 0
 
 //===--------------------------------------------------------------===//

@@ -169,14 +169,15 @@ authoritative place to change that is the LLVM submodule.
 
 - `llvm/lib/Target/GPU/GPUInstrInfo.td`
   - added machine instruction definitions for `GETSR`, `LD_LOCAL`, `ST_LOCAL`,
-    `ATOMIC_LOCAL`, `ATOMIC_LOCAL_CAS`, `BARRIER`, `MEM_FENCE`, and `HALT_RET`
+    `ATOMIC_LOCAL`, `ATOMIC_LOCAL_CAS`, `BARRIER`, `MEM_FENCE`, `FSQRT`, and
+    `HALT_RET`
   - reason: these are the compiler-visible instructions required by the new
     compute ABI and simulator/runtime bring-up
   - reviewer note: `HALT_RET` is not a new hardware opcode; it keeps a return
     register operand alive through lowering while encoding the same `halt`
 
 - `llvm/lib/Target/GPU/MCTargetDesc/GPUMCCodeEmitter.cpp`
-  - added actual binary encoding for those instructions
+  - added actual binary encoding for those instructions, including `FSQRT`
   - reason: instruction defs alone are not enough; the backend still has to
     emit the right 128-bit ISA words
 
@@ -187,6 +188,7 @@ authoritative place to change that is the LLVM submodule.
 
 - `llvm/lib/Target/GPU/GPUISelLowering.cpp`
   - lowers `llvm.gpu.getsr` to `GPUISD::GETSR`
+  - marks `ISD::FSQRT` legal so SelectionDAG can emit the native opcode
   - adds return-lowering support so return values stay live to `HALT_RET`
   - reason: special-register reads and the updated test coverage need proper
     lowering through the target DAG
@@ -244,6 +246,8 @@ authoritative place to change that is the LLVM submodule.
   - moved HLSL system values to raw workgroup state + compiler-derived IDs
   - added lowering for `GroupMemoryBarrierWithGroupSync()`
   - added lowering for `groupshared` `Interlocked*`
+  - now rebuilds `rsqrt` from a native `sqrt` intrinsic plus reciprocal instead
+    of a hand-rolled refinement sequence
   - added simple-allocation promotion after lowering
   - intentionally keeps `hlsl.shader` / `hlsl.numthreads` function attributes
     alive long enough for the metadata-emission pass to reflect them into
@@ -523,8 +527,8 @@ Hardware limitations and how the backend papers over them:
   generic `ExpandIRInsts` IR pass to expand all `sdiv`/`udiv`/`srem`/
   `urem` into the bit-by-bit shift/subtract sequence from
   `IntegerDivision.cpp` before ISel.
-- no `FSQRT`, `FSIN`, `FCOS`, `FPOW`, `FEXP`, `FLOG` — kernels that
-  call these still fail. Add polynomial approximations in source.
+- native `FSQRT` is available; `FSIN`, `FCOS`, `FPOW`, `FEXP`, and `FLOG`
+  still fail. Add polynomial approximations in source where needed.
 - no sub-word loads/stores (`LD_SCATTER` / `ST_SCATTER` are 32-bit) —
   the `GPUSubwordMemoryLowering` IR pass rewrites every `i1`/`i8`/`i16`
   load on `addrspace(1)` into an aligned i32 word load + shift/mask,
