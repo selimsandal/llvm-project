@@ -248,6 +248,11 @@ authoritative place to change that is the LLVM submodule.
   - added lowering for `groupshared` `Interlocked*`
   - now rebuilds `rsqrt` from a native `sqrt` intrinsic plus reciprocal instead
     of a hand-rolled refinement sequence
+  - updated the `llvm.sqrt` declaration lookup to pass `Module*` instead of
+    `Module&`
+  - reason: current upstream LLVM in this submodule exposes
+    `Intrinsic::getOrInsertDeclaration()` on `Module*`, and the stale call site
+    made `Scripts/compiler-build.sh` fail while compiling `GPUHLSLLowering.cpp`
   - added simple-allocation promotion after lowering
   - intentionally keeps `hlsl.shader` / `hlsl.numthreads` function attributes
     alive long enough for the metadata-emission pass to reflect them into

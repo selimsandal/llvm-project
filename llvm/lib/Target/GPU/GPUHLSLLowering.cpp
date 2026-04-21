@@ -1008,7 +1008,7 @@ bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
         Type *Ty = X->getType();
         Value *One = ConstantFP::get(Ty, 1.0);
         Function *Sqrt = Intrinsic::getOrInsertDeclaration(
-            M, Intrinsic::sqrt, {Ty});
+            &M, Intrinsic::sqrt, {Ty});
         Value *Root = Builder.CreateCall(Sqrt, {X}, "sqrt");
         Result = Builder.CreateFDiv(One, Root, "rsqrt");
         break;
