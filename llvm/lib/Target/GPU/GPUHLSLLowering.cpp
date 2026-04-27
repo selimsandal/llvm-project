@@ -47,6 +47,7 @@
 
 #include "GPU.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -270,6 +271,7 @@ enum DXIntrinsicKind {
   DX_STORE_RAWBUFFER,       // llvm.dx.resource.store.rawbuffer
   DX_LOAD_TYPEDBUFFER,      // llvm.dx.resource.load.typedbuffer
   DX_STORE_TYPEDBUFFER,     // llvm.dx.resource.store.typedbuffer
+  DX_LOAD_CBUFFERROW,       // llvm.dx.resource.load.cbufferrow.{2,4,8}
   // Wave ops
   DX_WAVE_GETLANEINDEX,     // llvm.dx.wave.getlaneindex
   DX_WAVE_GET_LANE_COUNT,   // llvm.dx.wave.get.lane.count
@@ -325,6 +327,8 @@ static DXIntrinsicKind classifyDXIntrinsic(StringRef Name) {
     return DX_LOAD_TYPEDBUFFER;
   if (Name.starts_with("llvm.dx.resource.store.typedbuffer"))
     return DX_STORE_TYPEDBUFFER;
+  if (Name.starts_with("llvm.dx.resource.load.cbufferrow"))
+    return DX_LOAD_CBUFFERROW;
 
   // Wave ops (overloaded, may have type suffixes)
   if (Name.starts_with("llvm.dx.wave.getlaneindex"))     return DX_WAVE_GETLANEINDEX;
@@ -597,10 +601,34 @@ bool GPUHLSLLowering::promoteSimpleAllocas(Module &M) {
 //        store i32 %val, ptr %ptr       ; → ST_SCATTER via ISel
 //===----------------------------------------------------------------------===//
 
-// Trace a getpointer handle operand back to its handlefrombinding call
-// and return the binding slot number (0-3).
-static bool getBindSlot(Value *Handle, unsigned &BindSlot) {
-  // Walk through casts/phis to find the handlefrombinding
+static bool isCBufferHandleType(Type *Ty) {
+  auto *TET = dyn_cast<TargetExtType>(Ty);
+  return TET && TET->getName() == "dx.CBuffer";
+}
+
+static bool isDXPaddingType(Type *Ty) {
+  auto *TET = dyn_cast<TargetExtType>(Ty);
+  return TET && TET->getName() == "dx.Padding";
+}
+
+static StructType *getCBufferLayoutType(GlobalVariable *HandleGV) {
+  auto *HandleTy = dyn_cast<TargetExtType>(HandleGV->getValueType());
+  if (!HandleTy || !isCBufferHandleType(HandleTy) ||
+      HandleTy->getNumTypeParameters() != 1)
+    return nullptr;
+
+  Type *LayoutTy = HandleTy->getTypeParameter(0);
+  if (auto *LayoutExt = dyn_cast<TargetExtType>(LayoutTy)) {
+    if (LayoutExt->getName() != "dx.Layout" ||
+        LayoutExt->getNumTypeParameters() != 1)
+      return nullptr;
+    LayoutTy = LayoutExt->getTypeParameter(0);
+  }
+
+  return dyn_cast<StructType>(LayoutTy);
+}
+
+static bool getDirectBindSlot(Value *Handle, unsigned &BindSlot) {
   auto *CI = dyn_cast<CallInst>(Handle);
   if (!CI)
     return false;
@@ -616,6 +644,34 @@ static bool getBindSlot(Value *Handle, unsigned &BindSlot) {
 
   BindSlot = BindC->getZExtValue();
   return true;
+}
+
+static bool getStoredHandleBindSlot(GlobalVariable *HandleGV,
+                                    unsigned &BindSlot) {
+  for (User *U : HandleGV->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand() != HandleGV)
+      continue;
+    if (getDirectBindSlot(SI->getValueOperand(), BindSlot))
+      return true;
+  }
+  return false;
+}
+
+// Trace a resource handle operand back to its handlefrombinding call and
+// return the binding slot number.
+static bool getBindSlot(Value *Handle, unsigned &BindSlot) {
+  if (getDirectBindSlot(Handle, BindSlot))
+    return true;
+
+  // clang emits HLSL cbuffers as handle globals: a handlefrombinding result is
+  // stored into @CB.cb, and cbuffer users load the handle back from that global.
+  if (auto *LI = dyn_cast<LoadInst>(Handle)) {
+    if (auto *GV = dyn_cast<GlobalVariable>(LI->getPointerOperand()))
+      return getStoredHandleBindSlot(GV, BindSlot);
+  }
+
+  return false;
 }
 
 // Map binding slot to GPU register name (0→r1, 1→r2, 2→r3, 3→r4)
@@ -680,13 +736,91 @@ static Value *createResourceAddress(IRBuilder<> &Builder, Value *Base,
   return Addr;
 }
 
+static Value *createByteAddress(IRBuilder<> &Builder, Value *Base,
+                                uint64_t Offset, Twine Name = "addr") {
+  if (Offset == 0)
+    return Base;
+  return Builder.CreateAdd(Base, Builder.getInt32(Offset), Name);
+}
+
+static Value *createByteAddress(IRBuilder<> &Builder, Value *Base,
+                                Value *Offset, Twine Name = "addr") {
+  return Builder.CreateAdd(Base, Offset, Name);
+}
+
+static LoadInst *createFlatLoad(IRBuilder<> &Builder, Module &M, Type *Ty,
+                                Value *Addr, Twine Name = "loaded") {
+  Value *Ptr =
+      Builder.CreateIntToPtr(Addr, PointerType::getUnqual(M.getContext()),
+                             "ld_ptr");
+  return Builder.CreateLoad(Ty, Ptr, Name);
+}
+
+struct CBufferMemberAccess {
+  GlobalVariable *Member;
+  unsigned BindSlot;
+  uint64_t Offset;
+};
+
+static void collectCBufferMembers(Module &M,
+                                  SmallVectorImpl<CBufferMemberAccess> &Members,
+                                  SmallVectorImpl<GlobalVariable *> &Handles) {
+  NamedMDNode *CBufMD = M.getNamedMetadata("hlsl.cbs");
+  if (!CBufMD)
+    return;
+
+  const DataLayout &DL = M.getDataLayout();
+  for (const MDNode *MD : CBufMD->operands()) {
+    if (!MD || MD->getNumOperands() == 0 || !MD->getOperand(0))
+      continue;
+
+    auto *HandleMD = dyn_cast<ValueAsMetadata>(MD->getOperand(0));
+    if (!HandleMD)
+      continue;
+    auto *HandleGV = dyn_cast<GlobalVariable>(HandleMD->getValue());
+    if (!HandleGV)
+      continue;
+
+    unsigned BindSlot = 0;
+    if (!getStoredHandleBindSlot(HandleGV, BindSlot))
+      continue;
+
+    StructType *LayoutTy = getCBufferLayoutType(HandleGV);
+    if (!LayoutTy)
+      continue;
+
+    const StructLayout *SL = DL.getStructLayout(LayoutTy);
+    SmallVector<uint64_t, 16> Offsets;
+    for (unsigned I = 0, E = LayoutTy->getNumElements(); I != E; ++I) {
+      if (!isDXPaddingType(LayoutTy->getElementType(I)))
+        Offsets.push_back(SL->getElementOffset(I));
+    }
+
+    Handles.push_back(HandleGV);
+    for (unsigned I = 1, E = MD->getNumOperands(); I != E; ++I) {
+      if (!MD->getOperand(I) || I - 1 >= Offsets.size())
+        continue;
+      auto *MemberMD = dyn_cast<ValueAsMetadata>(MD->getOperand(I));
+      if (!MemberMD)
+        continue;
+      auto *MemberGV = dyn_cast<GlobalVariable>(MemberMD->getValue());
+      if (!MemberGV)
+        continue;
+      Members.push_back({MemberGV, BindSlot, Offsets[I - 1]});
+    }
+  }
+}
+
 bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
   bool Changed = false;
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallInst *, 16> GetPtrCalls;
   SmallVector<CallInst *, 16> LoadCalls;
   SmallVector<CallInst *, 16> StoreCalls;
+  SmallVector<CallInst *, 16> CBufferRowCalls;
   SmallVector<CallInst *, 16> HandleCalls;
+  SmallVector<CBufferMemberAccess, 16> CBufferMembers;
+  SmallVector<GlobalVariable *, 8> CBufferHandles;
 
   // Collect all resource intrinsic calls
   for (Function &F : M) {
@@ -701,12 +835,14 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
       case DX_LOAD_TYPEDBUFFER: LoadCalls.push_back(CI); break;
       case DX_STORE_RAWBUFFER:
       case DX_STORE_TYPEDBUFFER: StoreCalls.push_back(CI); break;
+      case DX_LOAD_CBUFFERROW: CBufferRowCalls.push_back(CI); break;
       case DX_HANDLE_FROM_BINDING:
       case DX_HANDLE_FROM_IMPLICIT: HandleCalls.push_back(CI); break;
       default: break;
       }
     }
   }
+  collectCBufferMembers(M, CBufferMembers, CBufferHandles);
 
   // Count max binding slot to decide direct vs indirect path
   unsigned MaxBindSlot = 0;
@@ -716,6 +852,38 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
       MaxBindSlot = std::max(MaxBindSlot, (unsigned)BindC->getZExtValue());
   }
   bool UseIndirect = MaxBindSlot > 3;
+
+  // Lower clang-emitted cbuffer member globals. HLSL frontend IR models
+  // cbuffer members as external addrspace(2) globals linked to their cbuffer
+  // handle through !hlsl.cbs metadata. For GPU, each member is just a read from
+  // the bound cbuffer base plus its byte offset.
+  for (const CBufferMemberAccess &Member : CBufferMembers) {
+    SmallVector<LoadInst *, 8> Loads;
+    for (User *U : Member.Member->users()) {
+      if (auto *LI = dyn_cast<LoadInst>(U))
+        Loads.push_back(LI);
+    }
+
+    for (LoadInst *LI : Loads) {
+      IRBuilder<> Builder(LI);
+      Value *Base = getBindingBase(Builder, M, Member.BindSlot, UseIndirect);
+      if (!Base)
+        continue;
+
+      Value *Addr = createByteAddress(Builder, Base, Member.Offset);
+      LoadInst *Loaded =
+          createFlatLoad(Builder, M, LI->getType(), Addr, LI->getName());
+      Loaded->setAlignment(LI->getAlign());
+      LI->replaceAllUsesWith(Loaded);
+      LI->eraseFromParent();
+      Changed = true;
+    }
+
+    if (Member.Member->use_empty()) {
+      Member.Member->eraseFromParent();
+      Changed = true;
+    }
+  }
 
   // Lower getpointer: (handle, index) → inttoptr(base + index * elem_size)
   for (CallInst *CI : GetPtrCalls) {
@@ -733,10 +901,45 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     if (!Base)
       continue;
 
-    Value *Addr = createResourceAddress(Builder, Base, Index, ElemSize);
+    Value *Addr = isCBufferHandleType(Handle->getType())
+                      ? createByteAddress(Builder, Base, Index, "cb_addr")
+                      : createResourceAddress(Builder, Base, Index, ElemSize);
     Value *Ptr = Builder.CreateIntToPtr(Addr, CI->getType(), "buf_ptr");
 
     CI->replaceAllUsesWith(Ptr);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+
+  // Lower cbuffer row load: (handle, row) → {load(base + row*16 + elem_off)...}
+  for (CallInst *CI : CBufferRowCalls) {
+    Value *Handle = CI->getArgOperand(0);
+    Value *Row = CI->getArgOperand(1);
+
+    unsigned BindSlot;
+    if (!getBindSlot(Handle, BindSlot))
+      continue;
+
+    auto *RetTy = cast<StructType>(CI->getType());
+    Type *ElemTy = RetTy->getElementType(0);
+    unsigned ElemSize = DL.getTypeAllocSize(ElemTy);
+
+    IRBuilder<> Builder(CI);
+    Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
+    if (!Base)
+      continue;
+
+    Value *RowOffset =
+        Builder.CreateMul(Row, Builder.getInt32(16), "cb_row_offset");
+    Value *RowBase = createByteAddress(Builder, Base, RowOffset, "cb_row");
+    Value *Result = PoisonValue::get(RetTy);
+    for (unsigned I = 0, E = RetTy->getNumElements(); I != E; ++I) {
+      Value *Addr = createByteAddress(Builder, RowBase, I * ElemSize);
+      Value *Loaded = createFlatLoad(Builder, M, ElemTy, Addr, "cb_loaded");
+      Result = Builder.CreateInsertValue(Result, Loaded, {I});
+    }
+
+    CI->replaceAllUsesWith(Result);
     CI->eraseFromParent();
     Changed = true;
   }
@@ -814,7 +1017,28 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     Changed = true;
   }
 
-  // Remove dead handlefrombinding calls
+  // Drop clang's cbuffer handle materialization globals once all users have
+  // been lowered. These stores only exist to model DXIL handles in LLVM IR.
+  for (GlobalVariable *HandleGV : CBufferHandles) {
+    SmallVector<Instruction *, 8> DeadUsers;
+    for (User *U : HandleGV->users()) {
+      if (auto *LI = dyn_cast<LoadInst>(U)) {
+        if (LI->use_empty())
+          DeadUsers.push_back(LI);
+      } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+        DeadUsers.push_back(SI);
+      }
+    }
+    for (Instruction *I : DeadUsers) {
+      I->eraseFromParent();
+      Changed = true;
+    }
+    if (HandleGV->use_empty()) {
+      HandleGV->eraseFromParent();
+      Changed = true;
+    }
+  }
+
   for (CallInst *CI : HandleCalls) {
     if (CI->use_empty()) {
       CI->eraseFromParent();
@@ -829,7 +1053,7 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     if ((Kind == DX_HANDLE_FROM_BINDING || Kind == DX_HANDLE_FROM_IMPLICIT ||
          Kind == DX_RESOURCE_GETPOINTER || Kind == DX_LOAD_RAWBUFFER ||
          Kind == DX_STORE_RAWBUFFER || Kind == DX_LOAD_TYPEDBUFFER ||
-         Kind == DX_STORE_TYPEDBUFFER) &&
+         Kind == DX_STORE_TYPEDBUFFER || Kind == DX_LOAD_CBUFFERROW) &&
         F.use_empty())
       DeadFuncs.push_back(&F);
   }
