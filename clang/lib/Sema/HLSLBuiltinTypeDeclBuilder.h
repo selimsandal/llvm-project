@@ -102,6 +102,7 @@ public:
   BuiltinTypeDeclBuilder &addTextureLoadMethods(ResourceDimension Dim);
   BuiltinTypeDeclBuilder &addByteAddressBufferLoadMethods();
   BuiltinTypeDeclBuilder &addByteAddressBufferStoreMethods();
+  BuiltinTypeDeclBuilder &addByteAddressBufferInterlockedMethods();
   BuiltinTypeDeclBuilder &addSampleMethods(ResourceDimension Dim);
   BuiltinTypeDeclBuilder &addSampleBiasMethods(ResourceDimension Dim);
   BuiltinTypeDeclBuilder &addSampleGradMethods(ResourceDimension Dim);

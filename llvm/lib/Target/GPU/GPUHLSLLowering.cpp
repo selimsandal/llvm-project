@@ -79,7 +79,7 @@ public:
 private:
   bool lowerThreadIDIntrinsics(Module &M);
   bool lowerSyncIntrinsics(Module &M);
-  bool lowerSharedAtomicCalls(Module &M);
+  bool lowerInterlockedAtomicCalls(Module &M);
   bool lowerResourceAccess(Module &M);
   bool lowerWaveIntrinsics(Module &M);
   bool lowerMathIntrinsics(Module &M);
@@ -194,39 +194,39 @@ static Value *createWaveLaneIndex(IRBuilder<> &Builder, Module &M) {
   return Builder.CreateSub(LocalLinear, BaseLinear, "wave_lane");
 }
 
-enum HLSLSharedAtomicKind {
-  HLSL_SHARED_ATOMIC_NONE = 0,
-  HLSL_SHARED_ATOMIC_ADD,
-  HLSL_SHARED_ATOMIC_AND,
-  HLSL_SHARED_ATOMIC_OR,
-  HLSL_SHARED_ATOMIC_XOR,
-  HLSL_SHARED_ATOMIC_MIN,
-  HLSL_SHARED_ATOMIC_MAX,
-  HLSL_SHARED_ATOMIC_EXCHANGE,
-  HLSL_SHARED_ATOMIC_CMPXCHG,
+enum HLSLInterlockedAtomicKind {
+  HLSL_INTERLOCKED_ATOMIC_NONE = 0,
+  HLSL_INTERLOCKED_ATOMIC_ADD,
+  HLSL_INTERLOCKED_ATOMIC_AND,
+  HLSL_INTERLOCKED_ATOMIC_OR,
+  HLSL_INTERLOCKED_ATOMIC_XOR,
+  HLSL_INTERLOCKED_ATOMIC_MIN,
+  HLSL_INTERLOCKED_ATOMIC_MAX,
+  HLSL_INTERLOCKED_ATOMIC_EXCHANGE,
+  HLSL_INTERLOCKED_ATOMIC_CMPXCHG,
 };
 
-static HLSLSharedAtomicKind classifySharedAtomicCall(StringRef Name) {
+static HLSLInterlockedAtomicKind classifyInterlockedAtomicCall(StringRef Name) {
   if (Name.contains("InterlockedCompareExchange"))
-    return HLSL_SHARED_ATOMIC_CMPXCHG;
+    return HLSL_INTERLOCKED_ATOMIC_CMPXCHG;
   if (Name.contains("InterlockedExchange"))
-    return HLSL_SHARED_ATOMIC_EXCHANGE;
+    return HLSL_INTERLOCKED_ATOMIC_EXCHANGE;
   if (Name.contains("InterlockedAdd"))
-    return HLSL_SHARED_ATOMIC_ADD;
+    return HLSL_INTERLOCKED_ATOMIC_ADD;
   if (Name.contains("InterlockedAnd"))
-    return HLSL_SHARED_ATOMIC_AND;
+    return HLSL_INTERLOCKED_ATOMIC_AND;
   if (Name.contains("InterlockedOr"))
-    return HLSL_SHARED_ATOMIC_OR;
+    return HLSL_INTERLOCKED_ATOMIC_OR;
   if (Name.contains("InterlockedXor"))
-    return HLSL_SHARED_ATOMIC_XOR;
+    return HLSL_INTERLOCKED_ATOMIC_XOR;
   if (Name.contains("InterlockedMin"))
-    return HLSL_SHARED_ATOMIC_MIN;
+    return HLSL_INTERLOCKED_ATOMIC_MIN;
   if (Name.contains("InterlockedMax"))
-    return HLSL_SHARED_ATOMIC_MAX;
-  return HLSL_SHARED_ATOMIC_NONE;
+    return HLSL_INTERLOCKED_ATOMIC_MAX;
+  return HLSL_INTERLOCKED_ATOMIC_NONE;
 }
 
-static bool isUnsignedSharedAtomic(StringRef Name) {
+static bool isUnsignedInterlockedAtomic(StringRef Name) {
   return Name.contains('j') || Name.contains("uint") ||
          Name.contains("_unsigned");
 }
@@ -478,7 +478,7 @@ bool GPUHLSLLowering::lowerSyncIntrinsics(Module &M) {
   return Changed;
 }
 
-bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
+bool GPUHLSLLowering::lowerInterlockedAtomicCalls(Module &M) {
   bool Changed = false;
   SmallVector<CallInst *, 16> ToReplace;
   SmallVector<Function *, 8> ToDelete;
@@ -486,8 +486,9 @@ bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
   for (Function &F : M) {
     if (!F.isDeclaration())
       continue;
-    HLSLSharedAtomicKind Kind = classifySharedAtomicCall(F.getName());
-    if (Kind == HLSL_SHARED_ATOMIC_NONE)
+    HLSLInterlockedAtomicKind Kind =
+        classifyInterlockedAtomicCall(F.getName());
+    if (Kind == HLSL_INTERLOCKED_ATOMIC_NONE)
       continue;
 
     for (User *U : F.users()) {
@@ -500,37 +501,47 @@ bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
         continue;
 
       auto *PtrTy = dyn_cast<PointerType>(CI->getArgOperand(0)->getType());
-      if (!PtrTy || PtrTy->getAddressSpace() != 3)
+      if (!PtrTy)
         continue;
 
       IRBuilder<> Builder(CI);
       Value *OldValue = nullptr;
 
       switch (Kind) {
-      case HLSL_SHARED_ATOMIC_ADD:
-      case HLSL_SHARED_ATOMIC_AND:
-      case HLSL_SHARED_ATOMIC_OR:
-      case HLSL_SHARED_ATOMIC_XOR:
-      case HLSL_SHARED_ATOMIC_MIN:
-      case HLSL_SHARED_ATOMIC_MAX:
-      case HLSL_SHARED_ATOMIC_EXCHANGE: {
+      case HLSL_INTERLOCKED_ATOMIC_ADD:
+      case HLSL_INTERLOCKED_ATOMIC_AND:
+      case HLSL_INTERLOCKED_ATOMIC_OR:
+      case HLSL_INTERLOCKED_ATOMIC_XOR:
+      case HLSL_INTERLOCKED_ATOMIC_MIN:
+      case HLSL_INTERLOCKED_ATOMIC_MAX:
+      case HLSL_INTERLOCKED_ATOMIC_EXCHANGE: {
         AtomicRMWInst::BinOp Op = AtomicRMWInst::Add;
         switch (Kind) {
-        case HLSL_SHARED_ATOMIC_ADD:      Op = AtomicRMWInst::Add; break;
-        case HLSL_SHARED_ATOMIC_AND:      Op = AtomicRMWInst::And; break;
-        case HLSL_SHARED_ATOMIC_OR:       Op = AtomicRMWInst::Or; break;
-        case HLSL_SHARED_ATOMIC_XOR:      Op = AtomicRMWInst::Xor; break;
-        case HLSL_SHARED_ATOMIC_EXCHANGE: Op = AtomicRMWInst::Xchg; break;
-        case HLSL_SHARED_ATOMIC_MIN:
-          Op = isUnsignedSharedAtomic(F.getName()) ? AtomicRMWInst::UMin
-                                                   : AtomicRMWInst::Min;
+        case HLSL_INTERLOCKED_ATOMIC_ADD:
+          Op = AtomicRMWInst::Add;
           break;
-        case HLSL_SHARED_ATOMIC_MAX:
-          Op = isUnsignedSharedAtomic(F.getName()) ? AtomicRMWInst::UMax
-                                                   : AtomicRMWInst::Max;
+        case HLSL_INTERLOCKED_ATOMIC_AND:
+          Op = AtomicRMWInst::And;
           break;
-        case HLSL_SHARED_ATOMIC_NONE:
-        case HLSL_SHARED_ATOMIC_CMPXCHG:
+        case HLSL_INTERLOCKED_ATOMIC_OR:
+          Op = AtomicRMWInst::Or;
+          break;
+        case HLSL_INTERLOCKED_ATOMIC_XOR:
+          Op = AtomicRMWInst::Xor;
+          break;
+        case HLSL_INTERLOCKED_ATOMIC_EXCHANGE:
+          Op = AtomicRMWInst::Xchg;
+          break;
+        case HLSL_INTERLOCKED_ATOMIC_MIN:
+          Op = isUnsignedInterlockedAtomic(F.getName()) ? AtomicRMWInst::UMin
+                                                        : AtomicRMWInst::Min;
+          break;
+        case HLSL_INTERLOCKED_ATOMIC_MAX:
+          Op = isUnsignedInterlockedAtomic(F.getName()) ? AtomicRMWInst::UMax
+                                                        : AtomicRMWInst::Max;
+          break;
+        case HLSL_INTERLOCKED_ATOMIC_NONE:
+        case HLSL_INTERLOCKED_ATOMIC_CMPXCHG:
           break;
         }
         OldValue = Builder.CreateAtomicRMW(
@@ -538,7 +549,7 @@ bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
             AtomicOrdering::SequentiallyConsistent);
         break;
       }
-      case HLSL_SHARED_ATOMIC_CMPXCHG: {
+      case HLSL_INTERLOCKED_ATOMIC_CMPXCHG: {
         if (CI->arg_size() < 3)
           continue;
         auto *Pair = Builder.CreateAtomicCmpXchg(
@@ -548,7 +559,7 @@ bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
         OldValue = Builder.CreateExtractValue(Pair, 0, "interlocked_old");
         break;
       }
-      case HLSL_SHARED_ATOMIC_NONE:
+      case HLSL_INTERLOCKED_ATOMIC_NONE:
         break;
       }
 
@@ -557,9 +568,11 @@ bool GPUHLSLLowering::lowerSharedAtomicCalls(Module &M) {
 
       if (!CI->getType()->isVoidTy()) {
         CI->replaceAllUsesWith(OldValue);
-      } else if ((Kind != HLSL_SHARED_ATOMIC_CMPXCHG && CI->arg_size() >= 3) ||
-                 (Kind == HLSL_SHARED_ATOMIC_CMPXCHG && CI->arg_size() >= 4)) {
-        unsigned OutIdx = (Kind == HLSL_SHARED_ATOMIC_CMPXCHG) ? 3 : 2;
+      } else if ((Kind != HLSL_INTERLOCKED_ATOMIC_CMPXCHG &&
+                  CI->arg_size() >= 3) ||
+                 (Kind == HLSL_INTERLOCKED_ATOMIC_CMPXCHG &&
+                  CI->arg_size() >= 4)) {
+        unsigned OutIdx = (Kind == HLSL_INTERLOCKED_ATOMIC_CMPXCHG) ? 3 : 2;
         Builder.CreateStore(OldValue, CI->getArgOperand(OutIdx));
       }
 
@@ -1379,7 +1392,7 @@ bool GPUHLSLLowering::runOnModule(Module &M) {
   bool Changed = false;
   Changed |= lowerThreadIDIntrinsics(M);
   Changed |= lowerSyncIntrinsics(M);
-  Changed |= lowerSharedAtomicCalls(M);
+  Changed |= lowerInterlockedAtomicCalls(M);
   Changed |= promoteSimpleAllocas(M);
   Changed |= lowerResourceAccess(M);
   Changed |= lowerWaveIntrinsics(M);

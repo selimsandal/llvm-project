@@ -1598,6 +1598,64 @@ BuiltinTypeDeclBuilder::addByteAddressBufferStoreMethods() {
 }
 
 BuiltinTypeDeclBuilder &
+BuiltinTypeDeclBuilder::addByteAddressBufferInterlockedMethods() {
+  assert(!Record->isCompleteDefinition() && "record is already complete");
+
+  // Initial UAV Interlocked support is limited to byte-address buffers. Plain
+  // inout overloads for structured-buffer elements would atomic a temporary,
+  // not the backing resource element, so those need a dedicated frontend path.
+  ASTContext &AST = SemaRef.getASTContext();
+  using PH = BuiltinTypeMethodBuilder::PlaceHolder;
+
+  QualType UIntTy = AST.UnsignedIntTy;
+  QualType DeviceUIntTy =
+      AST.getAddrSpaceQualType(UIntTy, LangAS::hlsl_device);
+  QualType DeviceUIntPtrTy = AST.getPointerType(DeviceUIntTy);
+
+  auto AddFetchOp = [&](StringRef MethodName, StringRef BuiltinName) {
+    BuiltinTypeMethodBuilder(*this, MethodName, AST.VoidTy)
+        .addParam("Index", UIntTy)
+        .addParam("Value", UIntTy)
+        .callBuiltin("__builtin_hlsl_resource_getpointer_typed",
+                     DeviceUIntPtrTy, PH::Handle, PH::_0, UIntTy)
+        .callBuiltin(BuiltinName, UIntTy, PH::LastStmt, PH::_1)
+        .finalize();
+
+    BuiltinTypeMethodBuilder(*this, MethodName, AST.VoidTy)
+        .addParam("Index", UIntTy)
+        .addParam("Value", UIntTy)
+        .addParam("Original", UIntTy, HLSLParamModifierAttr::Keyword_out)
+        .callBuiltin("__builtin_hlsl_resource_getpointer_typed",
+                     DeviceUIntPtrTy, PH::Handle, PH::_0, UIntTy)
+        .callBuiltin(BuiltinName, UIntTy, PH::LastStmt, PH::_1)
+        .assign(PH::_2, PH::LastStmt)
+        .finalize();
+  };
+
+  AddFetchOp("InterlockedAdd", "__sync_fetch_and_add");
+  AddFetchOp("InterlockedAnd", "__sync_fetch_and_and");
+  AddFetchOp("InterlockedOr", "__sync_fetch_and_or");
+  AddFetchOp("InterlockedXor", "__sync_fetch_and_xor");
+  AddFetchOp("InterlockedMin", "__sync_fetch_and_umin");
+  AddFetchOp("InterlockedMax", "__sync_fetch_and_umax");
+  AddFetchOp("InterlockedExchange", "__sync_swap");
+
+  BuiltinTypeMethodBuilder(*this, "InterlockedCompareExchange", AST.VoidTy)
+      .addParam("Index", UIntTy)
+      .addParam("CompareValue", UIntTy)
+      .addParam("Value", UIntTy)
+      .addParam("Original", UIntTy, HLSLParamModifierAttr::Keyword_out)
+      .callBuiltin("__builtin_hlsl_resource_getpointer_typed",
+                   DeviceUIntPtrTy, PH::Handle, PH::_0, UIntTy)
+      .callBuiltin("__sync_val_compare_and_swap", UIntTy, PH::LastStmt, PH::_1,
+                   PH::_2)
+      .assign(PH::_3, PH::LastStmt)
+      .finalize();
+
+  return *this;
+}
+
+BuiltinTypeDeclBuilder &
 BuiltinTypeDeclBuilder::addSampleMethods(ResourceDimension Dim) {
   assert(!Record->isCompleteDefinition() && "record is already complete");
   ASTContext &AST = Record->getASTContext();
