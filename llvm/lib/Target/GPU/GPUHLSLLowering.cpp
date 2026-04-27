@@ -663,6 +663,23 @@ static unsigned getElementSize(Type *HandleType, const DataLayout &DL) {
   return 4;
 }
 
+static Value *createResourceAddress(IRBuilder<> &Builder, Value *Base,
+                                    Value *Index, unsigned ElemSize,
+                                    Value *ByteOffset = nullptr) {
+  Value *Addr;
+  if (ElemSize == 1) {
+    Addr = Builder.CreateAdd(Base, Index, "addr");
+  } else {
+    Value *Offset =
+        Builder.CreateMul(Index, Builder.getInt32(ElemSize), "idx_offset");
+    Addr = Builder.CreateAdd(Base, Offset, "addr");
+  }
+
+  if (ByteOffset)
+    Addr = Builder.CreateAdd(Addr, ByteOffset, "addr_final");
+  return Addr;
+}
+
 bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
   bool Changed = false;
   const DataLayout &DL = M.getDataLayout();
@@ -679,9 +696,11 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
       if (!CI)
         continue;
       switch (Kind) {
-      case DX_RESOURCE_GETPOINTER:  GetPtrCalls.push_back(CI); break;
-      case DX_LOAD_RAWBUFFER:       LoadCalls.push_back(CI); break;
-      case DX_STORE_RAWBUFFER:      StoreCalls.push_back(CI); break;
+      case DX_RESOURCE_GETPOINTER: GetPtrCalls.push_back(CI); break;
+      case DX_LOAD_RAWBUFFER:
+      case DX_LOAD_TYPEDBUFFER: LoadCalls.push_back(CI); break;
+      case DX_STORE_RAWBUFFER:
+      case DX_STORE_TYPEDBUFFER: StoreCalls.push_back(CI); break;
       case DX_HANDLE_FROM_BINDING:
       case DX_HANDLE_FROM_IMPLICIT: HandleCalls.push_back(CI); break;
       default: break;
@@ -714,14 +733,7 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     if (!Base)
       continue;
 
-    Value *Addr;
-    if (ElemSize == 1) {
-      Addr = Builder.CreateAdd(Base, Index, "elem_addr");
-    } else {
-      Value *Offset = Builder.CreateMul(Index,
-          Builder.getInt32(ElemSize), "byte_offset");
-      Addr = Builder.CreateAdd(Base, Offset, "elem_addr");
-    }
+    Value *Addr = createResourceAddress(Builder, Base, Index, ElemSize);
     Value *Ptr = Builder.CreateIntToPtr(Addr, CI->getType(), "buf_ptr");
 
     CI->replaceAllUsesWith(Ptr);
@@ -729,11 +741,16 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     Changed = true;
   }
 
-  // Lower rawbuffer load: (handle, index, byte_offset) → {load, true}
+  // Lower buffer load:
+  //   raw:   (handle, index, byte_offset) → {load, true}
+  //   typed: (handle, index)              → {load, true}
   for (CallInst *CI : LoadCalls) {
+    DXIntrinsicKind Kind =
+        classifyDXIntrinsic(CI->getCalledFunction()->getName());
+    bool IsRawBuffer = Kind == DX_LOAD_RAWBUFFER;
     Value *Handle = CI->getArgOperand(0);
     Value *Index = CI->getArgOperand(1);
-    Value *ByteOffset = CI->getArgOperand(2);
+    Value *ByteOffset = IsRawBuffer ? CI->getArgOperand(2) : nullptr;
 
     unsigned BindSlot;
     if (!getBindSlot(Handle, BindSlot))
@@ -749,10 +766,8 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
     if (!Base)
       continue;
-    Value *Offset = Builder.CreateMul(Index,
-        Builder.getInt32(ElemSize), "idx_offset");
-    Value *Addr = Builder.CreateAdd(Base, Offset, "addr");
-    Addr = Builder.CreateAdd(Addr, ByteOffset, "addr_final");
+    Value *Addr =
+        createResourceAddress(Builder, Base, Index, ElemSize, ByteOffset);
     Value *Ptr = Builder.CreateIntToPtr(Addr,
         PointerType::getUnqual(M.getContext()), "ld_ptr");
     Value *Loaded = Builder.CreateLoad(ElemTy, Ptr, "loaded");
@@ -767,12 +782,17 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     Changed = true;
   }
 
-  // Lower rawbuffer store: (handle, index, byte_offset, data) → store
+  // Lower buffer store:
+  //   raw:   (handle, index, byte_offset, data) → store
+  //   typed: (handle, index, data)              → store
   for (CallInst *CI : StoreCalls) {
+    DXIntrinsicKind Kind =
+        classifyDXIntrinsic(CI->getCalledFunction()->getName());
+    bool IsRawBuffer = Kind == DX_STORE_RAWBUFFER;
     Value *Handle = CI->getArgOperand(0);
     Value *Index = CI->getArgOperand(1);
-    Value *ByteOffset = CI->getArgOperand(2);
-    Value *Data = CI->getArgOperand(3);
+    Value *ByteOffset = IsRawBuffer ? CI->getArgOperand(2) : nullptr;
+    Value *Data = CI->getArgOperand(IsRawBuffer ? 3 : 2);
 
     unsigned BindSlot;
     if (!getBindSlot(Handle, BindSlot))
@@ -784,10 +804,8 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
     if (!Base)
       continue;
-    Value *Offset = Builder.CreateMul(Index,
-        Builder.getInt32(ElemSize), "idx_offset");
-    Value *Addr = Builder.CreateAdd(Base, Offset, "addr");
-    Addr = Builder.CreateAdd(Addr, ByteOffset, "addr_final");
+    Value *Addr =
+        createResourceAddress(Builder, Base, Index, ElemSize, ByteOffset);
     Value *Ptr = Builder.CreateIntToPtr(Addr,
         PointerType::getUnqual(M.getContext()), "st_ptr");
     Builder.CreateStore(Data, Ptr);
@@ -810,7 +828,8 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     DXIntrinsicKind Kind = classifyDXIntrinsic(F.getName());
     if ((Kind == DX_HANDLE_FROM_BINDING || Kind == DX_HANDLE_FROM_IMPLICIT ||
          Kind == DX_RESOURCE_GETPOINTER || Kind == DX_LOAD_RAWBUFFER ||
-         Kind == DX_STORE_RAWBUFFER) &&
+         Kind == DX_STORE_RAWBUFFER || Kind == DX_LOAD_TYPEDBUFFER ||
+         Kind == DX_STORE_TYPEDBUFFER) &&
         F.use_empty())
       DeadFuncs.push_back(&F);
   }
