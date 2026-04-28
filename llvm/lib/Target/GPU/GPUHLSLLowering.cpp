@@ -47,6 +47,8 @@
 //===--------------------------------------------------------------===//
 
 #include "GPU.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -84,6 +86,7 @@ private:
   bool lowerResourceAccess(Module &M);
   bool lowerWaveIntrinsics(Module &M);
   bool lowerMathIntrinsics(Module &M);
+  bool lowerScalarLLVMIntrinsics(Module &M);
   bool promoteSimpleAllocas(Module &M);
   bool stripHLSLMetadata(Module &M);
 };
@@ -294,6 +297,13 @@ enum DXIntrinsicKind {
   DX_WAVE_REDUCE_AND,       // llvm.dx.wave.reduce.and (not yet in upstream)
   DX_WAVE_REDUCE_XOR,       // llvm.dx.wave.reduce.xor
   // Math
+  DX_NCLAMP,                // llvm.dx.nclamp
+  DX_SCLAMP,                // llvm.dx.sclamp
+  DX_UCLAMP,                // llvm.dx.uclamp
+  DX_DOT2,                  // llvm.dx.dot2
+  DX_DOT3,                  // llvm.dx.dot3
+  DX_DOT4,                  // llvm.dx.dot4
+  DX_FDOT,                  // llvm.dx.fdot
   DX_LERP,                  // llvm.dx.lerp
   DX_SATURATE,              // llvm.dx.saturate
   DX_FRAC,                  // llvm.dx.frac
@@ -362,6 +372,13 @@ static DXIntrinsicKind classifyDXIntrinsic(StringRef Name) {
   if (Name.starts_with("llvm.dx.wave.reduce.xor"))       return DX_WAVE_REDUCE_XOR;
 
   // Math
+  if (Name.starts_with("llvm.dx.nclamp"))               return DX_NCLAMP;
+  if (Name.starts_with("llvm.dx.sclamp"))               return DX_SCLAMP;
+  if (Name.starts_with("llvm.dx.uclamp"))               return DX_UCLAMP;
+  if (Name.starts_with("llvm.dx.dot2"))                 return DX_DOT2;
+  if (Name.starts_with("llvm.dx.dot3"))                 return DX_DOT3;
+  if (Name.starts_with("llvm.dx.dot4"))                 return DX_DOT4;
+  if (Name.starts_with("llvm.dx.fdot"))                 return DX_FDOT;
   if (Name.starts_with("llvm.dx.lerp"))                  return DX_LERP;
   if (Name.starts_with("llvm.dx.saturate"))              return DX_SATURATE;
   if (Name.starts_with("llvm.dx.frac"))                  return DX_FRAC;
@@ -662,6 +679,37 @@ static bool isCBufferHandleType(Type *Ty) {
   return TET && TET->getName() == "dx.CBuffer";
 }
 
+static bool isDXResourceHandleType(Type *Ty) {
+  auto *TET = dyn_cast<TargetExtType>(Ty);
+  if (!TET)
+    return false;
+  StringRef Name = TET->getName();
+  return Name == "dx.CBuffer" || Name == "dx.RawBuffer" ||
+         Name == "dx.TypedBuffer";
+}
+
+static bool containsDXResourceHandleType(Type *Ty,
+                                         SmallPtrSetImpl<Type *> &Visited) {
+  if (!Visited.insert(Ty).second)
+    return false;
+  if (isDXResourceHandleType(Ty))
+    return true;
+  if (auto *ST = dyn_cast<StructType>(Ty)) {
+    for (Type *ElemTy : ST->elements()) {
+      if (containsDXResourceHandleType(ElemTy, Visited))
+        return true;
+    }
+  }
+  if (auto *AT = dyn_cast<ArrayType>(Ty))
+    return containsDXResourceHandleType(AT->getElementType(), Visited);
+  return false;
+}
+
+static bool containsDXResourceHandleType(Type *Ty) {
+  SmallPtrSet<Type *, 8> Visited;
+  return containsDXResourceHandleType(Ty, Visited);
+}
+
 static bool isDXPaddingType(Type *Ty) {
   auto *TET = dyn_cast<TargetExtType>(Ty);
   return TET && TET->getName() == "dx.Padding";
@@ -702,13 +750,22 @@ static bool getDirectBindSlot(Value *Handle, unsigned &BindSlot) {
   return true;
 }
 
-static bool getStoredHandleBindSlot(GlobalVariable *HandleGV,
-                                    unsigned &BindSlot) {
-  for (User *U : HandleGV->users()) {
+static bool getBindSlot(Value *Handle, unsigned &BindSlot,
+                        SmallPtrSetImpl<Value *> &Visited);
+
+static bool getStoredHandleBindSlot(Value *Ptr, unsigned &BindSlot,
+                                    SmallPtrSetImpl<Value *> &Visited) {
+  if (!Visited.insert(Ptr).second)
+    return false;
+
+  for (User *U : Ptr->users()) {
     auto *SI = dyn_cast<StoreInst>(U);
-    if (!SI || SI->getPointerOperand() != HandleGV)
+    if (!SI || SI->getPointerOperand() != Ptr)
       continue;
-    if (getDirectBindSlot(SI->getValueOperand(), BindSlot))
+    Value *Stored = SI->getValueOperand();
+    if (isa<PoisonValue>(Stored) || isa<UndefValue>(Stored))
+      continue;
+    if (getBindSlot(Stored, BindSlot, Visited))
       return true;
   }
   return false;
@@ -716,18 +773,31 @@ static bool getStoredHandleBindSlot(GlobalVariable *HandleGV,
 
 // Trace a resource handle operand back to its handlefrombinding call and
 // return the binding slot number.
-static bool getBindSlot(Value *Handle, unsigned &BindSlot) {
+static bool getBindSlot(Value *Handle, unsigned &BindSlot,
+                        SmallPtrSetImpl<Value *> &Visited) {
   if (getDirectBindSlot(Handle, BindSlot))
     return true;
 
-  // clang emits HLSL cbuffers as handle globals: a handlefrombinding result is
-  // stored into @CB.cb, and cbuffer users load the handle back from that global.
+  // clang can materialize resource wrapper objects at -O0: a
+  // handlefrombinding result is stored into a temporary/global object, and
+  // users load the handle back before getpointer/load/store intrinsics.
   if (auto *LI = dyn_cast<LoadInst>(Handle)) {
-    if (auto *GV = dyn_cast<GlobalVariable>(LI->getPointerOperand()))
-      return getStoredHandleBindSlot(GV, BindSlot);
+    if (getStoredHandleBindSlot(LI->getPointerOperand(), BindSlot, Visited))
+      return true;
   }
 
   return false;
+}
+
+static bool getBindSlot(Value *Handle, unsigned &BindSlot) {
+  SmallPtrSet<Value *, 16> Visited;
+  return getBindSlot(Handle, BindSlot, Visited);
+}
+
+static bool getStoredHandleBindSlot(GlobalVariable *HandleGV,
+                                    unsigned &BindSlot) {
+  SmallPtrSet<Value *, 16> Visited;
+  return getStoredHandleBindSlot(HandleGV, BindSlot, Visited);
 }
 
 // Map binding slot to GPU register name (0→r1, 1→r2, 2→r3, 3→r4)
@@ -865,6 +935,57 @@ static void collectCBufferMembers(Module &M,
       Members.push_back({MemberGV, BindSlot, Offsets[I - 1]});
     }
   }
+}
+
+static bool cleanupDeadResourceHandleMaterialization(Module &M) {
+  bool Changed = false;
+  bool LocalChanged = false;
+
+  do {
+    LocalChanged = false;
+    SmallVector<Instruction *, 32> ToErase;
+
+    for (Function &F : M) {
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (containsDXResourceHandleType(SI->getValueOperand()->getType()))
+              ToErase.push_back(SI);
+            continue;
+          }
+          if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (LI->use_empty() && containsDXResourceHandleType(LI->getType()))
+              ToErase.push_back(LI);
+            continue;
+          }
+          if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+            if (AI->use_empty() &&
+                containsDXResourceHandleType(AI->getAllocatedType()))
+              ToErase.push_back(AI);
+          }
+        }
+      }
+    }
+
+    for (Instruction *I : ToErase) {
+      I->eraseFromParent();
+      LocalChanged = true;
+      Changed = true;
+    }
+  } while (LocalChanged);
+
+  SmallVector<GlobalVariable *, 8> DeadGlobals;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.use_empty() && GV.hasLocalLinkage() &&
+        containsDXResourceHandleType(GV.getValueType()))
+      DeadGlobals.push_back(&GV);
+  }
+  for (GlobalVariable *GV : DeadGlobals) {
+    GV->eraseFromParent();
+    Changed = true;
+  }
+
+  return Changed;
 }
 
 bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
@@ -1095,6 +1216,8 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
     }
   }
 
+  Changed |= cleanupDeadResourceHandleMaterialization(M);
+
   for (CallInst *CI : HandleCalls) {
     if (CI->use_empty()) {
       CI->eraseFromParent();
@@ -1247,6 +1370,134 @@ bool GPUHLSLLowering::lowerWaveIntrinsics(Module &M) {
 // Math Intrinsic Lowering
 //===----------------------------------------------------------------------===//
 
+static Value *createClamp(IRBuilder<> &Builder, Module &M,
+                          DXIntrinsicKind Kind, Value *X, Value *Lo,
+                          Value *Hi) {
+  Intrinsic::ID MaxID = Intrinsic::not_intrinsic;
+  Intrinsic::ID MinID = Intrinsic::not_intrinsic;
+  switch (Kind) {
+  case DX_NCLAMP:
+    MaxID = Intrinsic::maxnum;
+    MinID = Intrinsic::minnum;
+    break;
+  case DX_SCLAMP:
+    MaxID = Intrinsic::smax;
+    MinID = Intrinsic::smin;
+    break;
+  case DX_UCLAMP:
+    MaxID = Intrinsic::umax;
+    MinID = Intrinsic::umin;
+    break;
+  default:
+    llvm_unreachable("unexpected clamp kind");
+  }
+
+  Type *Ty = X->getType();
+  Function *MaxFn = Intrinsic::getOrInsertDeclaration(&M, MaxID, {Ty});
+  Function *MinFn = Intrinsic::getOrInsertDeclaration(&M, MinID, {Ty});
+  Value *LowerBounded = Builder.CreateCall(MaxFn, {X, Lo}, "clamp.lo");
+  return Builder.CreateCall(MinFn, {LowerBounded, Hi}, "clamp");
+}
+
+static Value *createFloatDot(IRBuilder<> &Builder, Module &M, CallInst *CI,
+                             unsigned NumElts) {
+  Value *Acc = Builder.CreateFMul(CI->getArgOperand(0),
+                                  CI->getArgOperand(NumElts), "dot.mul");
+  Function *FMA =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::fma, {CI->getType()});
+  for (unsigned I = 1; I != NumElts; ++I)
+    Acc = Builder.CreateCall(
+        FMA, {CI->getArgOperand(I), CI->getArgOperand(I + NumElts), Acc},
+        "dot.fma");
+  return Acc;
+}
+
+static Value *createVectorFloatDot(IRBuilder<> &Builder, Module &M,
+                                   CallInst *CI) {
+  Value *A = CI->getArgOperand(0);
+  Value *B = CI->getArgOperand(1);
+  auto *VecTy = dyn_cast<FixedVectorType>(A->getType());
+  if (!VecTy || A->getType() != B->getType() ||
+      !CI->getType()->isFloatTy() || !VecTy->getElementType()->isFloatTy())
+    return nullptr;
+
+  unsigned NumElts = VecTy->getNumElements();
+  if (NumElts < 2 || NumElts > 4)
+    return nullptr;
+
+  Value *A0 = Builder.CreateExtractElement(A, Builder.getInt32(0), "dot.a0");
+  Value *B0 = Builder.CreateExtractElement(B, Builder.getInt32(0), "dot.b0");
+  Value *Acc = Builder.CreateFMul(A0, B0, "dot.mul");
+  Function *FMA =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::fma, {CI->getType()});
+  for (unsigned I = 1; I != NumElts; ++I) {
+    Value *AI =
+        Builder.CreateExtractElement(A, Builder.getInt32(I), "dot.a");
+    Value *BI =
+        Builder.CreateExtractElement(B, Builder.getInt32(I), "dot.b");
+    Acc = Builder.CreateCall(FMA, {AI, BI, Acc}, "dot.fma");
+  }
+  return Acc;
+}
+
+static Value *createTruncToFloat(IRBuilder<> &Builder, Value *X) {
+  Value *TruncI = Builder.CreateFPToSI(X, Builder.getInt32Ty(), "trunc_i");
+  return Builder.CreateSIToFP(TruncI, X->getType(), "trunc_f");
+}
+
+static Value *createFloorFromTrunc(IRBuilder<> &Builder, Value *X,
+                                   Value *TruncF) {
+  Value *NeedsCorrection = Builder.CreateFCmpOLT(X, TruncF);
+  return Builder.CreateSelect(
+      NeedsCorrection,
+      Builder.CreateFSub(TruncF, ConstantFP::get(X->getType(), 1.0)),
+      TruncF, "floor");
+}
+
+static Value *createCeilFromTrunc(IRBuilder<> &Builder, Value *X,
+                                  Value *TruncF) {
+  Value *NeedsCorrection = Builder.CreateFCmpOGT(X, TruncF);
+  return Builder.CreateSelect(
+      NeedsCorrection,
+      Builder.CreateFAdd(TruncF, ConstantFP::get(X->getType(), 1.0)),
+      TruncF, "ceil");
+}
+
+static Value *createRoundFromTrunc(IRBuilder<> &Builder, Value *X,
+                                   bool TiesToEven) {
+  Type *FloatTy = X->getType();
+  Value *TruncI = Builder.CreateFPToSI(X, Builder.getInt32Ty(), "round_i");
+  Value *TruncF = Builder.CreateSIToFP(TruncI, FloatTy, "round_trunc");
+  Value *Diff = Builder.CreateFSub(X, TruncF, "round_diff");
+  Value *Zero = ConstantFP::get(FloatTy, 0.0);
+  Value *Half = ConstantFP::get(FloatTy, 0.5);
+  Value *AbsDiff = Builder.CreateSelect(
+      Builder.CreateFCmpOLT(Diff, Zero),
+      Builder.CreateFNeg(Diff, "round_neg_diff"), Diff, "round_abs_diff");
+  Value *Step = Builder.CreateSelect(Builder.CreateFCmpOGT(Diff, Zero),
+                                     Builder.getInt32(1),
+                                     Builder.getInt32(-1), "round_step");
+  Value *RoundedAway = Builder.CreateAdd(TruncI, Step, "round_away");
+  Value *ShouldAdjust = nullptr;
+
+  if (TiesToEven) {
+    Value *GreaterThanHalf = Builder.CreateFCmpOGT(AbsDiff, Half);
+    Value *IsTie = Builder.CreateFCmpOEQ(AbsDiff, Half);
+    Value *IsOdd = Builder.CreateICmpNE(
+        Builder.CreateAnd(TruncI, Builder.getInt32(1), "round_odd_bit"),
+        Builder.getInt32(0), "round_is_odd");
+    ShouldAdjust =
+        Builder.CreateOr(GreaterThanHalf, Builder.CreateAnd(IsTie, IsOdd),
+                         "round_adjust");
+  } else {
+    ShouldAdjust = Builder.CreateFCmpOGE(AbsDiff, Half, "round_adjust");
+  }
+
+  Value *RoundedI =
+      Builder.CreateSelect(ShouldAdjust, RoundedAway, TruncI, "round_i32");
+  return Builder.CreateSIToFP(RoundedI, FloatTy, "round");
+}
+
 bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
   bool Changed = false;
   SmallVector<CallInst *, 16> ToReplace;
@@ -1254,7 +1505,7 @@ bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
 
   for (Function &F : M) {
     DXIntrinsicKind Kind = classifyDXIntrinsic(F.getName());
-    if (Kind < DX_LERP || Kind > DX_STEP)
+    if (Kind < DX_NCLAMP || Kind > DX_STEP)
       continue;
 
     for (User *U : F.users()) {
@@ -1267,6 +1518,24 @@ bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
       Value *Result = nullptr;
 
       switch (Kind) {
+      case DX_NCLAMP:
+      case DX_SCLAMP:
+      case DX_UCLAMP:
+        Result = createClamp(Builder, M, Kind, CI->getArgOperand(0),
+                             CI->getArgOperand(1), CI->getArgOperand(2));
+        break;
+      case DX_DOT2:
+        Result = createFloatDot(Builder, M, CI, 2);
+        break;
+      case DX_DOT3:
+        Result = createFloatDot(Builder, M, CI, 3);
+        break;
+      case DX_DOT4:
+        Result = createFloatDot(Builder, M, CI, 4);
+        break;
+      case DX_FDOT:
+        Result = createVectorFloatDot(Builder, M, CI);
+        break;
       case DX_LERP: {
         // lerp(a, b, t) = a + t * (b - a) = fma(t, b-a, a)
         Value *A = CI->getArgOperand(0);
@@ -1293,13 +1562,12 @@ bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
         break;
       }
       case DX_FRAC: {
-        // frac(x) = x - trunc(x)
-        // GPU has no floor; use FTOI+ITOF for truncation toward zero.
-        // Correct for positive values (typical use: UV coords, 0..1 range).
+        // frac(x) = x - floor(x). Build floor from truncation plus a negative
+        // fractional correction because the GPU only has FTOI/ITOF.
         Value *X = CI->getArgOperand(0);
-        Value *Trunc = Builder.CreateFPToSI(X, Builder.getInt32Ty(), "trunc_i");
-        Value *TruncF = Builder.CreateSIToFP(Trunc, X->getType(), "trunc_f");
-        Result = Builder.CreateFSub(X, TruncF, "frac");
+        Value *TruncF = createTruncToFloat(Builder, X);
+        Value *Floor = createFloorFromTrunc(Builder, X, TruncF);
+        Result = Builder.CreateFSub(X, Floor, "frac");
         break;
       }
       case DX_RSQRT: {
@@ -1390,6 +1658,91 @@ bool GPUHLSLLowering::lowerMathIntrinsics(Module &M) {
   return Changed;
 }
 
+bool GPUHLSLLowering::lowerScalarLLVMIntrinsics(Module &M) {
+  bool Changed = false;
+  SmallVector<CallInst *, 16> ToReplace;
+  SmallVector<Function *, 8> ToDelete;
+
+  for (Function &F : M) {
+    Intrinsic::ID ID = F.getIntrinsicID();
+    if (ID != Intrinsic::floor && ID != Intrinsic::ceil &&
+        ID != Intrinsic::trunc && ID != Intrinsic::round &&
+        ID != Intrinsic::roundeven && ID != Intrinsic::abs)
+      continue;
+
+    for (User *U : F.users()) {
+      auto *CI = dyn_cast<CallInst>(U);
+      if (!CI)
+        continue;
+
+      Type *RetTy = CI->getType();
+      if ((ID == Intrinsic::abs && RetTy->isIntegerTy(32)) ||
+          (ID != Intrinsic::abs && RetTy->isFloatTy()))
+        ToReplace.push_back(CI);
+    }
+
+    for (CallInst *CI : ToReplace) {
+      IRBuilder<> Builder(CI);
+      Value *Result = nullptr;
+
+      switch (ID) {
+      case Intrinsic::floor: {
+        Value *X = CI->getArgOperand(0);
+        Result =
+            createFloorFromTrunc(Builder, X, createTruncToFloat(Builder, X));
+        break;
+      }
+      case Intrinsic::ceil: {
+        Value *X = CI->getArgOperand(0);
+        Result =
+            createCeilFromTrunc(Builder, X, createTruncToFloat(Builder, X));
+        break;
+      }
+      case Intrinsic::trunc:
+        Result = createTruncToFloat(Builder, CI->getArgOperand(0));
+        break;
+      case Intrinsic::round:
+        Result = createRoundFromTrunc(Builder, CI->getArgOperand(0),
+                                      /*TiesToEven=*/false);
+        break;
+      case Intrinsic::roundeven:
+        Result = createRoundFromTrunc(Builder, CI->getArgOperand(0),
+                                      /*TiesToEven=*/true);
+        break;
+      case Intrinsic::abs: {
+        Value *X = CI->getArgOperand(0);
+        Value *Zero = Builder.getInt32(0);
+        bool IntMinIsPoison =
+            cast<ConstantInt>(CI->getArgOperand(1))->isOne();
+        Value *Neg = IntMinIsPoison ? Builder.CreateNSWNeg(X, "abs.neg")
+                                    : Builder.CreateNeg(X, "abs.neg");
+        Result = Builder.CreateSelect(Builder.CreateICmpSLT(X, Zero), Neg, X,
+                                      "abs");
+        break;
+      }
+      default:
+        break;
+      }
+
+      if (!Result)
+        continue;
+
+      CI->replaceAllUsesWith(Result);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    ToReplace.clear();
+
+    if (F.use_empty())
+      ToDelete.push_back(&F);
+  }
+
+  for (Function *F : ToDelete)
+    F->eraseFromParent();
+
+  return Changed;
+}
+
 //===----------------------------------------------------------------------===//
 // Metadata / Attribute Cleanup
 //===----------------------------------------------------------------------===//
@@ -1440,6 +1793,7 @@ bool GPUHLSLLowering::runOnModule(Module &M) {
   Changed |= lowerResourceAccess(M);
   Changed |= lowerWaveIntrinsics(M);
   Changed |= lowerMathIntrinsics(M);
+  Changed |= lowerScalarLLVMIntrinsics(M);
   Changed |= stripHLSLMetadata(M);
 
   return Changed;
