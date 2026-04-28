@@ -26,7 +26,7 @@ attributes #0 = { convergent noinline norecurse "hlsl.numthreads"="8,1,1" "hlsl.
 ; CHECK-LABEL: CSMain:
 ; CHECK: getsr
 ; CHECK: st_local
-; CHECK: barrier	0
+; CHECK: barrier	1
 ; CHECK: ld_local
 ; CHECK: st_local
 ; CHECK: halt

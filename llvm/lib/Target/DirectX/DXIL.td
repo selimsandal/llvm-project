@@ -933,8 +933,16 @@ def Barrier : DXILOp<80, barrier> {
   let intrinsics = [
     IntrinSelect<int_dx_group_memory_barrier,
                  [IntrinArgI32<BarrierMode_GroupMemoryBarrier>]>,
+    IntrinSelect<int_dx_device_memory_barrier,
+                 [IntrinArgI32<BarrierMode_DeviceMemoryBarrier>]>,
+    IntrinSelect<int_dx_all_memory_barrier,
+                 [IntrinArgI32<BarrierMode_AllMemoryBarrier>]>,
     IntrinSelect<int_dx_group_memory_barrier_with_group_sync,
                  [IntrinArgI32<BarrierMode_GroupMemoryBarrierWithGroupSync>]>,
+    IntrinSelect<int_dx_device_memory_barrier_with_group_sync,
+                 [IntrinArgI32<BarrierMode_DeviceMemoryBarrierWithGroupSync>]>,
+    IntrinSelect<int_dx_all_memory_barrier_with_group_sync,
+                 [IntrinArgI32<BarrierMode_AllMemoryBarrierWithGroupSync>]>,
   ];
 
   let arguments = [Int32Ty];

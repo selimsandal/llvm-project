@@ -180,6 +180,12 @@ static unsigned mapOpenCLFenceFlagsToMode(uint32_t Flags) {
 
 // Match SPIR-V and OpenCL builtin names for thread ID functions
 static OpenCLBuiltinKind classifyBuiltin(StringRef Name) {
+  // DirectX/HLSL intrinsics are handled by GPUHLSLLowering. Keep this pass from
+  // matching broad words like "barrier" inside llvm.dx.* names before that pass
+  // gets a chance to apply HLSL-specific semantics.
+  if (Name.starts_with("llvm.dx."))
+    return GPU_BUILTIN_NONE;
+
   // SPIR-V names (from SPIRV-LLVM-Translator metadata path)
   if (Name.contains("GlobalInvocationId")) return GPU_BUILTIN_GLOBAL_ID;
   if (Name.contains("WorkgroupId"))        return GPU_BUILTIN_GROUP_ID;
@@ -232,6 +238,41 @@ static bool isAtomicBuiltin(OpenCLBuiltinKind Kind) {
   default:
     return false;
   }
+}
+
+static bool classifySPVSyncIntrinsic(StringRef Name, Intrinsic::ID &IntrID,
+                                     unsigned &Mode) {
+  if (Name == "llvm.spv.group.memory.barrier") {
+    IntrID = Intrinsic::gpu_mem_fence;
+    Mode = 1;
+    return true;
+  }
+  if (Name == "llvm.spv.device.memory.barrier") {
+    IntrID = Intrinsic::gpu_mem_fence;
+    Mode = 2;
+    return true;
+  }
+  if (Name == "llvm.spv.all.memory.barrier") {
+    IntrID = Intrinsic::gpu_mem_fence;
+    Mode = 3;
+    return true;
+  }
+  if (Name == "llvm.spv.group.memory.barrier.with.group.sync") {
+    IntrID = Intrinsic::gpu_workgroup_sync;
+    Mode = 1;
+    return true;
+  }
+  if (Name == "llvm.spv.device.memory.barrier.with.group.sync") {
+    IntrID = Intrinsic::gpu_workgroup_sync;
+    Mode = 2;
+    return true;
+  }
+  if (Name == "llvm.spv.all.memory.barrier.with.group.sync") {
+    IntrID = Intrinsic::gpu_workgroup_sync;
+    Mode = 3;
+    return true;
+  }
+  return false;
 }
 
 bool GPUSPIRVLowering::lowerBuiltinCalls(Module &M) {
@@ -316,8 +357,14 @@ bool GPUSPIRVLowering::lowerSyncBuiltins(Module &M) {
   for (Function &F : M) {
     if (!F.isDeclaration())
       continue;
-    OpenCLBuiltinKind Kind = classifyBuiltin(F.getName());
-    if (Kind != GPU_BUILTIN_BARRIER && Kind != GPU_BUILTIN_MEM_FENCE)
+    Intrinsic::ID FixedIntrID = Intrinsic::not_intrinsic;
+    unsigned FixedMode = 0;
+    bool IsFixedSPVSync =
+        classifySPVSyncIntrinsic(F.getName(), FixedIntrID, FixedMode);
+    OpenCLBuiltinKind Kind = IsFixedSPVSync ? GPU_BUILTIN_NONE
+                                            : classifyBuiltin(F.getName());
+    if (!IsFixedSPVSync &&
+        Kind != GPU_BUILTIN_BARRIER && Kind != GPU_BUILTIN_MEM_FENCE)
       continue;
 
     for (User *U : F.users()) {
@@ -327,17 +374,21 @@ bool GPUSPIRVLowering::lowerSyncBuiltins(Module &M) {
 
     for (CallInst *CI : ToReplace) {
       IRBuilder<> Builder(CI);
-      unsigned Mode = 0;
-      if (CI->arg_size() != 0) {
+      unsigned Mode = FixedMode;
+      if (!IsFixedSPVSync && CI->arg_size() != 0) {
         if (auto *Flags = dyn_cast<ConstantInt>(CI->getArgOperand(0)))
           Mode = mapOpenCLFenceFlagsToMode((uint32_t)Flags->getZExtValue());
       }
 
-      Intrinsic::ID IntrID = (Kind == GPU_BUILTIN_BARRIER)
-                                 ? Intrinsic::gpu_workgroup_sync
-                                 : Intrinsic::gpu_mem_fence;
+      Intrinsic::ID IntrID =
+          IsFixedSPVSync ? FixedIntrID
+                         : ((Kind == GPU_BUILTIN_BARRIER)
+                                ? Intrinsic::gpu_workgroup_sync
+                                : Intrinsic::gpu_mem_fence);
       Function *Sync = Intrinsic::getOrInsertDeclaration(&M, IntrID, {});
-      Builder.CreateCall(Sync, {Builder.getInt32(Mode)});
+      SmallVector<OperandBundleDef, 1> Bundles;
+      CI->getOperandBundlesAsDefs(Bundles);
+      Builder.CreateCall(Sync, {Builder.getInt32(Mode)}, Bundles);
       CI->eraseFromParent();
       Changed = true;
     }

@@ -23,10 +23,11 @@
 //
 // Current verified source-level HLSL compute subset also includes:
 //   groupshared globals    → addrspace(3) globals → LD_LOCAL/ST_LOCAL
-//   GroupMemoryBarrierWithGroupSync()
-//                         → llvm.gpu.workgroup.sync(0)
-// The sync lowering is intentionally conservative for now and uses the strong
-// barrier mode instead of a narrower groupshared-only mode.
+//   *MemoryBarrier()      → llvm.gpu.mem.fence(mode)
+//   *MemoryBarrierWithGroupSync()
+//                         → llvm.gpu.workgroup.sync(mode)
+// Barrier modes match the OpenCL/SPIR-V lowering convention:
+//   group/local = 1, device/global = 2, all = 3.
 //
 // Resource Binding → GPU Register Mapping:
 //   register(u0/t0/b0)    → r1 (descriptor init_r1)
@@ -262,7 +263,12 @@ enum DXIntrinsicKind {
   DX_GROUP_ID,              // llvm.dx.group.id
   DX_THREAD_ID_IN_GROUP,    // llvm.dx.thread.id.in.group
   DX_FLATTENED_THREAD_ID,   // llvm.dx.flattened.thread.id.in.group
+  DX_GROUP_MEMORY_BARRIER,
+  DX_DEVICE_MEMORY_BARRIER,
+  DX_ALL_MEMORY_BARRIER,
   DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC,
+  DX_DEVICE_MEMORY_BARRIER_WITH_GROUP_SYNC,
+  DX_ALL_MEMORY_BARRIER_WITH_GROUP_SYNC,
   // Resources
   DX_HANDLE_FROM_BINDING,   // llvm.dx.resource.handlefrombinding
   DX_HANDLE_FROM_IMPLICIT,  // llvm.dx.resource.handlefromimplicitbinding
@@ -309,8 +315,15 @@ static DXIntrinsicKind classifyDXIntrinsic(StringRef Name) {
   if (Name == "llvm.dx.group.id")                        return DX_GROUP_ID;
   if (Name == "llvm.dx.thread.id.in.group")              return DX_THREAD_ID_IN_GROUP;
   if (Name == "llvm.dx.flattened.thread.id.in.group")    return DX_FLATTENED_THREAD_ID;
+  if (Name == "llvm.dx.group.memory.barrier")            return DX_GROUP_MEMORY_BARRIER;
+  if (Name == "llvm.dx.device.memory.barrier")           return DX_DEVICE_MEMORY_BARRIER;
+  if (Name == "llvm.dx.all.memory.barrier")              return DX_ALL_MEMORY_BARRIER;
   if (Name == "llvm.dx.group.memory.barrier.with.group.sync")
     return DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC;
+  if (Name == "llvm.dx.device.memory.barrier.with.group.sync")
+    return DX_DEVICE_MEMORY_BARRIER_WITH_GROUP_SYNC;
+  if (Name == "llvm.dx.all.memory.barrier.with.group.sync")
+    return DX_ALL_MEMORY_BARRIER_WITH_GROUP_SYNC;
 
   // Resources (overloaded intrinsics have type suffixes)
   if (Name.starts_with("llvm.dx.resource.handlefrombinding"))
@@ -444,9 +457,40 @@ bool GPUHLSLLowering::lowerSyncIntrinsics(Module &M) {
   SmallVector<CallInst *, 8> ToReplace;
   SmallVector<Function *, 4> ToDelete;
 
+  auto IsBarrierKind = [](DXIntrinsicKind Kind) {
+    return Kind == DX_GROUP_MEMORY_BARRIER ||
+           Kind == DX_DEVICE_MEMORY_BARRIER ||
+           Kind == DX_ALL_MEMORY_BARRIER ||
+           Kind == DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC ||
+           Kind == DX_DEVICE_MEMORY_BARRIER_WITH_GROUP_SYNC ||
+           Kind == DX_ALL_MEMORY_BARRIER_WITH_GROUP_SYNC;
+  };
+
+  auto BarrierMode = [](DXIntrinsicKind Kind) -> unsigned {
+    switch (Kind) {
+    case DX_GROUP_MEMORY_BARRIER:
+    case DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC:
+      return 1;
+    case DX_DEVICE_MEMORY_BARRIER:
+    case DX_DEVICE_MEMORY_BARRIER_WITH_GROUP_SYNC:
+      return 2;
+    case DX_ALL_MEMORY_BARRIER:
+    case DX_ALL_MEMORY_BARRIER_WITH_GROUP_SYNC:
+      return 3;
+    default:
+      return 0;
+    }
+  };
+
+  auto HasGroupSync = [](DXIntrinsicKind Kind) {
+    return Kind == DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC ||
+           Kind == DX_DEVICE_MEMORY_BARRIER_WITH_GROUP_SYNC ||
+           Kind == DX_ALL_MEMORY_BARRIER_WITH_GROUP_SYNC;
+  };
+
   for (Function &F : M) {
     DXIntrinsicKind Kind = classifyDXIntrinsic(F.getName());
-    if (Kind != DX_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC)
+    if (!IsBarrierKind(Kind))
       continue;
 
     for (User *U : F.users()) {
@@ -456,13 +500,12 @@ bool GPUHLSLLowering::lowerSyncIntrinsics(Module &M) {
 
     for (CallInst *CI : ToReplace) {
       IRBuilder<> Builder(CI);
-      Function *Barrier =
-          Intrinsic::getOrInsertDeclaration(&M, Intrinsic::gpu_workgroup_sync,
-                                            {});
-      // Use the conservative strong/all-memory barrier mode for now.
-      // It is stricter than pure groupshared ordering, but correct on the
-      // current hardware/software contract.
-      Builder.CreateCall(Barrier, {Builder.getInt32(0)});
+      Intrinsic::ID IntrID = HasGroupSync(Kind) ? Intrinsic::gpu_workgroup_sync
+                                                : Intrinsic::gpu_mem_fence;
+      Function *Sync = Intrinsic::getOrInsertDeclaration(&M, IntrID, {});
+      SmallVector<OperandBundleDef, 1> Bundles;
+      CI->getOperandBundlesAsDefs(Bundles);
+      Builder.CreateCall(Sync, {Builder.getInt32(BarrierMode(Kind))}, Bundles);
       CI->eraseFromParent();
       Changed = true;
     }

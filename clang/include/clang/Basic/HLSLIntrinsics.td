@@ -1008,6 +1008,32 @@ accesses have been completed.
   let IsConvergent = 1;
 }
 
+// Blocks execution until all device memory accesses by the calling thread have
+// completed.
+def hlsl_device_memory_barrier :
+    HLSLBuiltin<"DeviceMemoryBarrier",
+                "__builtin_hlsl_device_memory_barrier"> {
+  let Doc = [{
+\fn void DeviceMemoryBarrier(void)
+\brief Blocks execution until all device memory accesses by the calling thread
+have been completed.
+}];
+  let IsConvergent = 1;
+}
+
+// Blocks execution until all memory accesses by the calling thread have
+// completed.
+def hlsl_all_memory_barrier :
+    HLSLBuiltin<"AllMemoryBarrier",
+                "__builtin_hlsl_all_memory_barrier"> {
+  let Doc = [{
+\fn void AllMemoryBarrier(void)
+\brief Blocks execution until all memory accesses by the calling thread have
+been completed.
+}];
+  let IsConvergent = 1;
+}
+
 // Blocks execution of all threads in a group until all group shared accesses
 // have been completed and all threads in the group have reached this call.
 def hlsl_group_memory_barrier_with_group_sync :
@@ -1018,6 +1044,32 @@ def hlsl_group_memory_barrier_with_group_sync :
 \brief Blocks execution of all threads in a group until all group shared
 accesses have been completed and all threads in the group have reached this
 call.
+}];
+  let IsConvergent = 1;
+}
+
+// Blocks execution of all threads in a group until all device memory accesses
+// have completed and all threads in the group have reached this call.
+def hlsl_device_memory_barrier_with_group_sync :
+    HLSLBuiltin<"DeviceMemoryBarrierWithGroupSync",
+                "__builtin_hlsl_device_memory_barrier_with_group_sync"> {
+  let Doc = [{
+\fn void DeviceMemoryBarrierWithGroupSync(void)
+\brief Blocks execution until all device memory accesses have completed and all
+threads in the group have reached this call.
+}];
+  let IsConvergent = 1;
+}
+
+// Blocks execution of all threads in a group until all memory accesses have
+// completed and all threads in the group have reached this call.
+def hlsl_all_memory_barrier_with_group_sync :
+    HLSLBuiltin<"AllMemoryBarrierWithGroupSync",
+                "__builtin_hlsl_all_memory_barrier_with_group_sync"> {
+  let Doc = [{
+\fn void AllMemoryBarrierWithGroupSync(void)
+\brief Blocks execution until all memory accesses have completed and all
+threads in the group have reached this call.
 }];
   let IsConvergent = 1;
 }
