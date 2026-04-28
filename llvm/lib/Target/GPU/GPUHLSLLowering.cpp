@@ -287,6 +287,7 @@ enum DXIntrinsicKind {
   DX_WAVE_IS_FIRST_LANE,    // llvm.dx.wave.is.first.lane
   DX_WAVE_ALL,              // llvm.dx.wave.all
   DX_WAVE_ANY,              // llvm.dx.wave.any
+  DX_WAVE_READLANE,         // llvm.dx.wave.readlane
   DX_WAVE_REDUCE_SUM,       // llvm.dx.wave.reduce.sum
   DX_WAVE_REDUCE_USUM,      // llvm.dx.wave.reduce.usum
   DX_WAVE_REDUCE_MAX,       // llvm.dx.wave.reduce.max
@@ -361,6 +362,7 @@ static DXIntrinsicKind classifyDXIntrinsic(StringRef Name) {
   if (Name.starts_with("llvm.dx.wave.all") &&
       !Name.starts_with("llvm.dx.wave.all.equal"))       return DX_WAVE_ALL;
   if (Name.starts_with("llvm.dx.wave.any"))              return DX_WAVE_ANY;
+  if (Name.starts_with("llvm.dx.wave.readlane"))         return DX_WAVE_READLANE;
   if (Name.starts_with("llvm.dx.wave.reduce.usum"))      return DX_WAVE_REDUCE_USUM;
   if (Name.starts_with("llvm.dx.wave.reduce.sum"))       return DX_WAVE_REDUCE_SUM;
   if (Name.starts_with("llvm.dx.wave.reduce.umax"))      return DX_WAVE_REDUCE_UMAX;
@@ -1246,10 +1248,86 @@ bool GPUHLSLLowering::lowerResourceAccess(Module &M) {
 // Wave Intrinsic Lowering → GPU REDUCE
 //===----------------------------------------------------------------------===//
 
+static Value *createWaveReadLaneBroadcast(IRBuilder<> &Builder, Module &M,
+                                          CallInst *CI) {
+  Value *Src = CI->getArgOperand(0);
+  auto *LaneC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!LaneC) {
+    M.getContext().emitError(
+        CI, "GPU HLSL lowering only supports WaveReadLaneAt with a "
+            "constant lane index; dynamic shuffle requires GPU-side support");
+    return PoisonValue::get(CI->getType());
+  }
+  uint64_t LaneIndex = LaneC->getZExtValue();
+  if (LaneIndex >= 8) {
+    M.getContext().emitError(
+        CI, "GPU HLSL lowering requires WaveReadLaneAt constant lane index "
+            "to be in the fixed 8-lane wave range [0, 7]");
+    return PoisonValue::get(CI->getType());
+  }
+
+  Type *Ty = Src->getType();
+  if (!Ty->isIntegerTy(1) && !Ty->isIntegerTy(32) && !Ty->isFloatTy()) {
+    M.getContext().emitError(
+        CI, "GPU HLSL lowering only supports scalar i1/i32/f32 "
+            "WaveReadLaneAt values");
+    return PoisonValue::get(CI->getType());
+  }
+
+  Value *Lane = createWaveLaneIndex(Builder, M);
+  Value *IsSourceLane =
+      Builder.CreateICmpEQ(Lane, Builder.getInt32(LaneIndex),
+                           "wave_readlane_source");
+
+  Value *Bits = Src;
+  if (Ty->isIntegerTy(1))
+    Bits = Builder.CreateZExt(Src, Builder.getInt32Ty(), "readlane.zext");
+  else if (Ty->isFloatTy())
+    Bits = Builder.CreateBitCast(Src, Builder.getInt32Ty(), "readlane.bits");
+
+  Value *Selected = Builder.CreateSelect(IsSourceLane, Bits, Builder.getInt32(0),
+                                         "readlane.selected");
+  Function *ReduceOr =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::gpu_reduce_or, {});
+  Value *Reduced = Builder.CreateCall(ReduceOr, {Selected}, "readlane");
+
+  if (Ty->isIntegerTy(1))
+    return Builder.CreateICmpNE(Reduced, Builder.getInt32(0), "readlane.bool");
+  if (Ty->isFloatTy())
+    return Builder.CreateBitCast(Reduced, Ty, "readlane.float");
+  return Reduced;
+}
+
 bool GPUHLSLLowering::lowerWaveIntrinsics(Module &M) {
   bool Changed = false;
   SmallVector<CallInst *, 16> ToReplace;
   SmallVector<Function *, 8> ToDelete;
+
+  // Lower constant-index WaveReadLaneAt as a broadcast using REDUCE_OR. The
+  // current GPU ISA does not have a general per-lane shuffle, so non-constant
+  // lane indices are rejected instead of being silently miscompiled.
+  for (Function &F : M) {
+    DXIntrinsicKind Kind = classifyDXIntrinsic(F.getName());
+    if (Kind != DX_WAVE_READLANE)
+      continue;
+
+    for (User *U : F.users()) {
+      if (auto *CI = dyn_cast<CallInst>(U))
+        ToReplace.push_back(CI);
+    }
+
+    for (CallInst *CI : ToReplace) {
+      IRBuilder<> Builder(CI);
+      Value *Result = createWaveReadLaneBroadcast(Builder, M, CI);
+      CI->replaceAllUsesWith(Result);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    ToReplace.clear();
+
+    if (F.use_empty())
+      ToDelete.push_back(&F);
+  }
 
   for (Function &F : M) {
     DXIntrinsicKind Kind = classifyDXIntrinsic(F.getName());
