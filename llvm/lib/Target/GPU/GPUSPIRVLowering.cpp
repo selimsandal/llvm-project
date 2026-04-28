@@ -32,6 +32,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsGPU.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Module.h"
@@ -61,6 +62,7 @@ private:
   bool lowerBuiltinCalls(Module &M);
   bool lowerSyncBuiltins(Module &M);
   bool lowerAtomicBuiltins(Module &M);
+  bool lowerResourceAccess(Module &M);
   bool lowerMathBuiltins(Module &M);
   bool stripCallingConventions(Module &M);
   bool stripSPIRVMetadata(Module &M);
@@ -81,6 +83,7 @@ enum OpenCLBuiltinKind {
   GPU_BUILTIN_GLOBAL_SIZE,
   GPU_BUILTIN_LOCAL_SIZE,
   GPU_BUILTIN_NUM_GROUPS,
+  GPU_BUILTIN_FLATTENED_LOCAL_ID,
   GPU_BUILTIN_BARRIER,
   GPU_BUILTIN_MEM_FENCE,
   GPU_BUILTIN_ATOMIC_ADD,
@@ -112,6 +115,16 @@ static Value *createGpuGetSR(IRBuilder<> &Builder, Module &M, unsigned SReg) {
   Function *GetSR = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::gpu_getsr,
                                                       {});
   return Builder.CreateCall(GetSR, {Builder.getInt32(SReg)});
+}
+
+static Value *createRegRead(IRBuilder<> &Builder, Module &M,
+                            const char *RegName) {
+  Function *ReadReg = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::read_register, {Builder.getInt32Ty()});
+  MDNode *RegMD =
+      MDNode::get(M.getContext(), {MDString::get(M.getContext(), RegName)});
+  return Builder.CreateCall(
+      ReadReg, {MetadataAsValue::get(M.getContext(), RegMD)});
 }
 
 static Value *createDimSelect(IRBuilder<> &Builder, Value *Dim,
@@ -157,6 +170,18 @@ static Value *createGlobalID(IRBuilder<> &Builder, Module &M, Value *Dim) {
                            "global_id");
 }
 
+static Value *createFlattenedLocalID(IRBuilder<> &Builder, Module &M) {
+  Value *X = createGpuGetSR(Builder, M, SREG_LOCAL_ID_X);
+  Value *Y = createGpuGetSR(Builder, M, SREG_LOCAL_ID_Y);
+  Value *Z = createGpuGetSR(Builder, M, SREG_LOCAL_ID_Z);
+  Value *SizeX = createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_X);
+  Value *SizeY = createGpuGetSR(Builder, M, SREG_LOCAL_SIZE_Y);
+  Value *ScaledZ = Builder.CreateMul(Z, SizeY, "lin_z");
+  Value *YZ = Builder.CreateAdd(Y, ScaledZ, "lin_yz");
+  return Builder.CreateAdd(X, Builder.CreateMul(YZ, SizeX, "lin_xy"),
+                           "lin_idx");
+}
+
 static Value *createGlobalSize(IRBuilder<> &Builder, Module &M, Value *Dim) {
   Value *NumGroups = createNumGroups(Builder, M, Dim);
   Value *LocalSize = createLocalSize(Builder, M, Dim);
@@ -193,6 +218,16 @@ static OpenCLBuiltinKind classifyBuiltin(StringRef Name) {
   if (Name.contains("GlobalSize"))         return GPU_BUILTIN_GLOBAL_SIZE;
   if (Name.contains("WorkgroupSize"))      return GPU_BUILTIN_LOCAL_SIZE;
   if (Name.contains("NumWorkgroups"))      return GPU_BUILTIN_NUM_GROUPS;
+
+  // HLSL SPIR-V frontend intrinsics.
+  if (Name.starts_with("llvm.spv.thread.id.in.group"))
+    return GPU_BUILTIN_LOCAL_ID;
+  if (Name.starts_with("llvm.spv.thread.id"))
+    return GPU_BUILTIN_GLOBAL_ID;
+  if (Name.starts_with("llvm.spv.group.id"))
+    return GPU_BUILTIN_GROUP_ID;
+  if (Name.starts_with("llvm.spv.flattened.thread.id.in.group"))
+    return GPU_BUILTIN_FLATTENED_LOCAL_ID;
 
   // OpenCL C mangled names (from clang -target spir round-trip)
   // _Z13get_global_idj = get_global_id(uint)
@@ -238,6 +273,104 @@ static bool isAtomicBuiltin(OpenCLBuiltinKind Kind) {
   default:
     return false;
   }
+}
+
+enum SPVResourceKind {
+  SPV_RESOURCE_NONE = 0,
+  SPV_HANDLE_FROM_BINDING,
+  SPV_COUNTER_HANDLE_FROM_IMPLICIT,
+  SPV_RESOURCE_GETPOINTER,
+};
+
+static SPVResourceKind classifySPVResource(StringRef Name) {
+  if (Name.starts_with("llvm.spv.resource.handlefrombinding"))
+    return SPV_HANDLE_FROM_BINDING;
+  if (Name.starts_with("llvm.spv.resource.counterhandlefromimplicitbinding"))
+    return SPV_COUNTER_HANDLE_FROM_IMPLICIT;
+  if (Name.starts_with("llvm.spv.resource.getpointer"))
+    return SPV_RESOURCE_GETPOINTER;
+  return SPV_RESOURCE_NONE;
+}
+
+static bool isSPVVulkanBufferHandleType(Type *Ty) {
+  auto *TET = dyn_cast<TargetExtType>(Ty);
+  return TET && TET->getName() == "spirv.VulkanBuffer";
+}
+
+static bool getDirectSPVBindSlot(Value *Handle, unsigned &BindSlot) {
+  auto *CI = dyn_cast<CallInst>(Handle);
+  if (!CI || !CI->getCalledFunction())
+    return false;
+  if (!isSPVVulkanBufferHandleType(Handle->getType()))
+    return false;
+
+  if (classifySPVResource(CI->getCalledFunction()->getName()) !=
+      SPV_HANDLE_FROM_BINDING)
+    return false;
+
+  // handlefrombinding args: (space, binding, range_size, index, name_ptr)
+  auto *BindC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!BindC)
+    return false;
+
+  BindSlot = BindC->getZExtValue();
+  return true;
+}
+
+static const char *bindSlotToReg(unsigned Slot) {
+  switch (Slot) {
+  case 0:
+    return "r1";
+  case 1:
+    return "r2";
+  case 2:
+    return "r3";
+  case 3:
+    return "r4";
+  default:
+    return nullptr;
+  }
+}
+
+static Value *getBindingBase(IRBuilder<> &Builder, Module &M,
+                             unsigned BindSlot, bool UseIndirect) {
+  if (!UseIndirect) {
+    const char *RegName = bindSlotToReg(BindSlot);
+    if (!RegName)
+      return nullptr;
+    return createRegRead(Builder, M, RegName);
+  }
+
+  Value *ArgsPtr = createRegRead(Builder, M, "r1");
+  Value *Offset = Builder.getInt32(BindSlot * 4);
+  Value *Addr = Builder.CreateAdd(ArgsPtr, Offset, "arg_addr");
+  Value *Ptr = Builder.CreateIntToPtr(
+      Addr, PointerType::getUnqual(M.getContext()), "arg_ptr");
+  return Builder.CreateLoad(Builder.getInt32Ty(), Ptr, "arg_val");
+}
+
+static unsigned getSPVResourceElementSize(Type *HandleType,
+                                          const DataLayout &DL) {
+  auto *TET = dyn_cast<TargetExtType>(HandleType);
+  if (!TET || !isSPVVulkanBufferHandleType(HandleType) ||
+      TET->getNumTypeParameters() == 0)
+    return 4;
+
+  Type *ElemTy = TET->getTypeParameter(0);
+  if (auto *ArrayTy = dyn_cast<ArrayType>(ElemTy))
+    ElemTy = ArrayTy->getElementType();
+
+  return DL.getTypeAllocSize(ElemTy);
+}
+
+static Value *createResourceAddress(IRBuilder<> &Builder, Value *Base,
+                                    Value *Index, unsigned ElemSize) {
+  if (ElemSize == 1)
+    return Builder.CreateAdd(Base, Index, "addr");
+
+  Value *Offset =
+      Builder.CreateMul(Index, Builder.getInt32(ElemSize), "idx_offset");
+  return Builder.CreateAdd(Base, Offset, "addr");
 }
 
 static bool classifySPVSyncIntrinsic(StringRef Name, Intrinsic::ID &IntrID,
@@ -316,6 +449,9 @@ bool GPUSPIRVLowering::lowerBuiltinCalls(Module &M) {
         break;
       case GPU_BUILTIN_NUM_GROUPS:
         Result = createNumGroups(Builder, M, Dim);
+        break;
+      case GPU_BUILTIN_FLATTENED_LOCAL_ID:
+        Result = createFlattenedLocalID(Builder, M);
         break;
       case GPU_BUILTIN_BARRIER:
       case GPU_BUILTIN_MEM_FENCE:
@@ -467,6 +603,7 @@ bool GPUSPIRVLowering::lowerAtomicBuiltins(Module &M) {
         case GPU_BUILTIN_GLOBAL_SIZE:
         case GPU_BUILTIN_LOCAL_SIZE:
         case GPU_BUILTIN_NUM_GROUPS:
+        case GPU_BUILTIN_FLATTENED_LOCAL_ID:
         case GPU_BUILTIN_BARRIER:
         case GPU_BUILTIN_MEM_FENCE:
           break;
@@ -495,6 +632,7 @@ bool GPUSPIRVLowering::lowerAtomicBuiltins(Module &M) {
       case GPU_BUILTIN_GLOBAL_SIZE:
       case GPU_BUILTIN_LOCAL_SIZE:
       case GPU_BUILTIN_NUM_GROUPS:
+      case GPU_BUILTIN_FLATTENED_LOCAL_ID:
       case GPU_BUILTIN_BARRIER:
       case GPU_BUILTIN_MEM_FENCE:
         break;
@@ -513,6 +651,80 @@ bool GPUSPIRVLowering::lowerAtomicBuiltins(Module &M) {
   }
 
   for (Function *F : ToDelete)
+    F->eraseFromParent();
+
+  return Changed;
+}
+
+bool GPUSPIRVLowering::lowerResourceAccess(Module &M) {
+  bool Changed = false;
+  const DataLayout &DL = M.getDataLayout();
+  SmallVector<CallInst *, 16> GetPtrCalls;
+  SmallVector<CallInst *, 16> HandleCalls;
+
+  for (Function &F : M) {
+    SPVResourceKind Kind = classifySPVResource(F.getName());
+    if (Kind == SPV_RESOURCE_NONE)
+      continue;
+
+    for (User *U : F.users()) {
+      auto *CI = dyn_cast<CallInst>(U);
+      if (!CI)
+        continue;
+      if (Kind == SPV_RESOURCE_GETPOINTER)
+        GetPtrCalls.push_back(CI);
+      else
+        HandleCalls.push_back(CI);
+    }
+  }
+
+  unsigned MaxBindSlot = 0;
+  for (CallInst *CI : HandleCalls) {
+    if (classifySPVResource(CI->getCalledFunction()->getName()) !=
+        SPV_HANDLE_FROM_BINDING)
+      continue;
+    if (auto *BindC = dyn_cast<ConstantInt>(CI->getArgOperand(1)))
+      MaxBindSlot = std::max(MaxBindSlot, (unsigned)BindC->getZExtValue());
+  }
+  bool UseIndirect = MaxBindSlot > 3;
+
+  for (CallInst *CI : GetPtrCalls) {
+    if (CI->arg_size() < 2)
+      continue;
+
+    Value *Handle = CI->getArgOperand(0);
+    unsigned BindSlot = 0;
+    if (!getDirectSPVBindSlot(Handle, BindSlot))
+      continue;
+
+    IRBuilder<> Builder(CI);
+    Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
+    if (!Base)
+      continue;
+
+    unsigned ElemSize = getSPVResourceElementSize(Handle->getType(), DL);
+    Value *Addr =
+        createResourceAddress(Builder, Base, CI->getArgOperand(1), ElemSize);
+    Value *Ptr = Builder.CreateIntToPtr(Addr, CI->getType(), "buf_ptr");
+
+    CI->replaceAllUsesWith(Ptr);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+
+  for (CallInst *CI : HandleCalls) {
+    if (CI->use_empty()) {
+      CI->eraseFromParent();
+      Changed = true;
+    }
+  }
+
+  SmallVector<Function *, 8> DeadFuncs;
+  for (Function &F : M) {
+    if (classifySPVResource(F.getName()) != SPV_RESOURCE_NONE && F.use_empty())
+      DeadFuncs.push_back(&F);
+  }
+  for (Function *F : DeadFuncs)
     F->eraseFromParent();
 
   return Changed;
@@ -821,6 +1033,7 @@ bool GPUSPIRVLowering::runOnModule(Module &M) {
   Changed |= lowerBuiltinCalls(M);
   Changed |= lowerSyncBuiltins(M);
   Changed |= lowerAtomicBuiltins(M);
+  Changed |= lowerResourceAccess(M);
   Changed |= lowerMathBuiltins(M);
   // `markHelpersAlwaysInline` must run BEFORE `stripCallingConventions`
   // because it identifies kernels by their `SPIR_KERNEL` calling
