@@ -86,6 +86,68 @@ Working:
   - `groupshared` globals, `GroupMemoryBarrierWithGroupSync()`, and the
     verified `groupshared` `Interlocked*` subset compile on this path
 
+## HLSL Math Lowering Status
+
+This section tracks how HLSL math reaches the GPU ISA. The important split is
+whether the HLSL lowering pass emits an already-native LLVM operation, or
+whether it synthesizes a sequence because the GPU has no dedicated opcode for
+that HLSL intrinsic.
+
+Native final ISA coverage already exists for these scalar operations:
+
+| IR operation shape | Final GPU instruction | Notes |
+|--------------------|-----------------------|-------|
+| `llvm.fma.f32` | `FMA` | HLSL lowering emits this directly for `lerp` and dot-product accumulation; the post-RA peephole can also merge eligible `FMUL` + `FADD` pairs into `FMA` independently. |
+| `llvm.sqrt.f32` | `FSQRT` | Used by `rsqrt` lowering before the reciprocal divide. |
+| `llvm.maxnum.f32` / `llvm.minnum.f32` | `FMAX` / `FMIN` | Used by `nclamp` and `saturate`. |
+| `llvm.smax/smin/umax/umin.i32` | `SMAX` / `SMIN` / `UMAX` / `UMIN` | Used by signed and unsigned clamp. |
+| ordinary `fadd/fsub/fmul/fdiv` | `FADD` / `FSUB` / `FMUL` / `FDIV` | Used by expanded math formulas. |
+| ordinary `add/sub/mul/and/or/xor/shl/lshr/ashr` | integer ALU ops | Used by integer math and scalar helper sequences. |
+| `llvm.gpu.reduce_*` | `REDUCE` | Used by HLSL wave reductions and constant-lane `WaveReadLaneAt`. |
+
+HLSL-specific math currently lowered in `GPUHLSLLowering.cpp`:
+
+| HLSL / DX intrinsic | Lowering strategy | Native dependency |
+|---------------------|-------------------|-------------------|
+| `nclamp(x, lo, hi)` | `minnum(maxnum(x, lo), hi)` | `FMAX` + `FMIN` |
+| `sclamp(x, lo, hi)` | `smin(smax(x, lo), hi)` | `SMAX` + `SMIN` |
+| `uclamp(x, lo, hi)` | `umin(umax(x, lo), hi)` | `UMAX` + `UMIN` |
+| `dot2/dot3/dot4` | first lane multiply, then an `llvm.fma` chain | `FMUL` + `FMA` |
+| `fdot` for `float2/3/4` | extract vector lanes, then the same dot sequence | `FMUL` + `FMA` |
+| `lerp(a, b, t)` | `llvm.fma(t, b - a, a)` | `FSUB` + `FMA` |
+| `saturate(x)` | `minnum(maxnum(x, 0), 1)` | `FMAX` + `FMIN` |
+| `frac(x)` | `x - floor(x)`; floor is built from truncation plus negative correction | `FTOI` + `ITOF` + compare/select + `FSUB` |
+| `rsqrt(x)` | `1.0 / sqrt(x)` | `FSQRT` + `FDIV` |
+| `imad/umad(a, b, c)` | `a * b + c` | integer `MUL` + `ADD` |
+| `degrees(x)` | `x * (180 / pi)` | `FMUL` |
+| `radians(x)` | `x * (pi / 180)` | `FMUL` |
+| `sign(x)` | compare/select to `-1`, `0`, or `1` | compare + `SEL` |
+| `step(y, x)` | `(x >= y) ? 1.0 : 0.0` | compare + `SEL` |
+
+Scalar LLVM intrinsics that Clang can emit on the HLSL path are also rewritten
+before instruction selection:
+
+| LLVM intrinsic | Lowering strategy | Native dependency |
+|----------------|-------------------|-------------------|
+| `llvm.floor.f32` | truncation plus negative correction | `FTOI` + `ITOF` + compare/select |
+| `llvm.ceil.f32` | truncation plus positive correction | `FTOI` + `ITOF` + compare/select |
+| `llvm.trunc.f32` | float-to-int then int-to-float | `FTOI` + `ITOF` |
+| `llvm.round.f32` | truncation plus half-away adjustment | `FTOI` + `ITOF` + compare/select |
+| `llvm.roundeven.f32` | truncation plus ties-to-even adjustment | `FTOI` + `ITOF` + compare/select + integer parity test |
+| `llvm.abs.i32` | compare/select between `x` and `-x` | integer ALU + `SEL` |
+
+Current math gaps:
+
+- the HLSL lowering does not implement transcendental/library-style intrinsics
+  such as `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `exp`, `log`, or `pow`
+- no native `RSQRT`, `FRAC`, `FLOOR`, `CEIL`, or `ROUND` opcode exists; those
+  are synthesized as instruction sequences
+- the explicit math lowering is scalar `i32` / `f32` focused; wider vectors,
+  half, double, and i64 variants are only supported if earlier LLVM passes
+  scalarize or rewrite them into the covered shapes
+- this is the HLSL compute path only; OpenCL/SPIR-V math builtins are handled
+  separately in `GPUSPIRVLowering.cpp`
+
 ## External Tools
 
 | Tool | Location | Use |
