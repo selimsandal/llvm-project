@@ -28,6 +28,8 @@
 //===--------------------------------------------------------------===//
 
 #include "GPU.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
@@ -36,6 +38,7 @@
 #include "llvm/IR/IntrinsicsGPU.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Pass.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -69,6 +72,7 @@ private:
   bool removeDuplicateKernels(Module &M);
   bool promoteWrapperAllocas(Module &M);
   bool markHelpersAlwaysInline(Module &M);
+  bool inlineAlwaysInlineHelpers(Module &M);
 };
 
 char GPUSPIRVLowering::ID = 0;
@@ -297,7 +301,74 @@ static bool isSPVVulkanBufferHandleType(Type *Ty) {
   return TET && TET->getName() == "spirv.VulkanBuffer";
 }
 
-static bool getDirectSPVBindSlot(Value *Handle, unsigned &BindSlot) {
+static bool typeContainsSPVVulkanBuffer(Type *Ty) {
+  if (isSPVVulkanBufferHandleType(Ty))
+    return true;
+  if (auto *ST = dyn_cast<StructType>(Ty)) {
+    for (Type *ElemTy : ST->elements())
+      if (typeContainsSPVVulkanBuffer(ElemTy))
+        return true;
+  }
+  if (auto *AT = dyn_cast<ArrayType>(Ty))
+    return typeContainsSPVVulkanBuffer(AT->getElementType());
+  return false;
+}
+
+static Value *getSPVHandleStorageKey(Value *Ptr) {
+  Ptr = Ptr->stripPointerCasts();
+
+  auto *GEP = dyn_cast<GEPOperator>(Ptr);
+  if (!GEP)
+    return Ptr;
+
+  for (Value *Idx : GEP->indices()) {
+    auto *CI = dyn_cast<ConstantInt>(Idx);
+    if (!CI || !CI->isZero())
+      return Ptr;
+  }
+
+  return getSPVHandleStorageKey(GEP->getPointerOperand());
+}
+
+static bool getStoredConstantUInt(Value *Ptr, unsigned &Out) {
+  Value *Key = getSPVHandleStorageKey(Ptr);
+  ConstantInt *Stored = nullptr;
+
+  for (User *U : Key->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || getSPVHandleStorageKey(SI->getPointerOperand()) != Key)
+      continue;
+    auto *CI = dyn_cast<ConstantInt>(SI->getValueOperand());
+    if (!CI)
+      return false;
+    if (Stored && Stored->getZExtValue() != CI->getZExtValue())
+      return false;
+    Stored = CI;
+  }
+
+  if (!Stored)
+    return false;
+  Out = Stored->getZExtValue();
+  return true;
+}
+
+static bool getConstantUInt(Value *V, unsigned &Out) {
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    Out = CI->getZExtValue();
+    return true;
+  }
+  if (auto *LI = dyn_cast<LoadInst>(V))
+    return getStoredConstantUInt(LI->getPointerOperand(), Out);
+  return false;
+}
+
+struct SPVResourceHandleInfo {
+  unsigned BindSlot = 0;
+  Type *HandleType = nullptr;
+};
+
+static bool getDirectSPVHandleInfo(Value *Handle,
+                                   SPVResourceHandleInfo &Info) {
   auto *CI = dyn_cast<CallInst>(Handle);
   if (!CI || !CI->getCalledFunction())
     return false;
@@ -309,11 +380,29 @@ static bool getDirectSPVBindSlot(Value *Handle, unsigned &BindSlot) {
     return false;
 
   // handlefrombinding args: (space, binding, range_size, index, name_ptr)
-  auto *BindC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-  if (!BindC)
+  unsigned BindSlot = 0;
+  if (!getConstantUInt(CI->getArgOperand(1), BindSlot))
     return false;
 
-  BindSlot = BindC->getZExtValue();
+  Info = {BindSlot, Handle->getType()};
+  return true;
+}
+
+static bool getSPVHandleInfo(
+    Value *Handle, const DenseMap<Value *, SPVResourceHandleInfo> &StoredHandles,
+    SPVResourceHandleInfo &Info) {
+  if (getDirectSPVHandleInfo(Handle, Info))
+    return true;
+
+  auto *LI = dyn_cast<LoadInst>(Handle);
+  if (!LI || !isSPVVulkanBufferHandleType(LI->getType()))
+    return false;
+
+  auto It = StoredHandles.find(getSPVHandleStorageKey(LI->getPointerOperand()));
+  if (It == StoredHandles.end())
+    return false;
+
+  Info = It->second;
   return true;
 }
 
@@ -661,6 +750,7 @@ bool GPUSPIRVLowering::lowerResourceAccess(Module &M) {
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallInst *, 16> GetPtrCalls;
   SmallVector<CallInst *, 16> HandleCalls;
+  DenseMap<Value *, SPVResourceHandleInfo> StoredHandles;
 
   for (Function &F : M) {
     SPVResourceKind Kind = classifySPVResource(F.getName());
@@ -678,31 +768,70 @@ bool GPUSPIRVLowering::lowerResourceAccess(Module &M) {
     }
   }
 
+  bool LocalChanged = true;
+  while (LocalChanged) {
+    LocalChanged = false;
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          auto *SI = dyn_cast<StoreInst>(&I);
+          if (!SI || !isSPVVulkanBufferHandleType(
+                         SI->getValueOperand()->getType()))
+            continue;
+
+          SPVResourceHandleInfo Info;
+          if (!getSPVHandleInfo(SI->getValueOperand(), StoredHandles, Info))
+            continue;
+
+          Value *Key = getSPVHandleStorageKey(SI->getPointerOperand());
+          auto It = StoredHandles.find(Key);
+          if (It != StoredHandles.end() &&
+              It->second.BindSlot == Info.BindSlot &&
+              It->second.HandleType == Info.HandleType)
+            continue;
+
+          StoredHandles[Key] = Info;
+          LocalChanged = true;
+        }
+      }
+    }
+  }
+
   unsigned MaxBindSlot = 0;
   for (CallInst *CI : HandleCalls) {
-    if (classifySPVResource(CI->getCalledFunction()->getName()) !=
-        SPV_HANDLE_FROM_BINDING)
-      continue;
-    if (auto *BindC = dyn_cast<ConstantInt>(CI->getArgOperand(1)))
-      MaxBindSlot = std::max(MaxBindSlot, (unsigned)BindC->getZExtValue());
+    SPVResourceHandleInfo Info;
+    if (getDirectSPVHandleInfo(CI, Info))
+      MaxBindSlot = std::max(MaxBindSlot, Info.BindSlot);
+  }
+  for (const auto &Entry : StoredHandles) {
+    MaxBindSlot = std::max(MaxBindSlot, Entry.second.BindSlot);
   }
   bool UseIndirect = MaxBindSlot > 3;
+  bool AllBufferGetPointersLowered = true;
 
   for (CallInst *CI : GetPtrCalls) {
     if (CI->arg_size() < 2)
       continue;
 
     Value *Handle = CI->getArgOperand(0);
-    unsigned BindSlot = 0;
-    if (!getDirectSPVBindSlot(Handle, BindSlot))
+    if (!isSPVVulkanBufferHandleType(Handle->getType()))
       continue;
 
+    SPVResourceHandleInfo Info;
+    if (!getSPVHandleInfo(Handle, StoredHandles, Info)) {
+      AllBufferGetPointersLowered = false;
+      continue;
+    }
+
     IRBuilder<> Builder(CI);
-    Value *Base = getBindingBase(Builder, M, BindSlot, UseIndirect);
+    Value *Base = getBindingBase(Builder, M, Info.BindSlot, UseIndirect);
     if (!Base)
       continue;
 
-    unsigned ElemSize = getSPVResourceElementSize(Handle->getType(), DL);
+    unsigned ElemSize = getSPVResourceElementSize(Info.HandleType, DL);
     Value *Addr =
         createResourceAddress(Builder, Base, CI->getArgOperand(1), ElemSize);
     Value *Ptr = Builder.CreateIntToPtr(Addr, CI->getType(), "buf_ptr");
@@ -710,6 +839,70 @@ bool GPUSPIRVLowering::lowerResourceAccess(Module &M) {
     CI->replaceAllUsesWith(Ptr);
     CI->eraseFromParent();
     Changed = true;
+  }
+
+  if (AllBufferGetPointersLowered) {
+    SmallVector<Instruction *, 32> DeadHandleInsts;
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (isSPVVulkanBufferHandleType(LI->getType())) {
+              if (!LI->use_empty())
+                LI->replaceAllUsesWith(PoisonValue::get(LI->getType()));
+              DeadHandleInsts.push_back(LI);
+            }
+            continue;
+          }
+
+          auto *SI = dyn_cast<StoreInst>(&I);
+          if (SI && isSPVVulkanBufferHandleType(
+                        SI->getValueOperand()->getType()))
+            DeadHandleInsts.push_back(SI);
+        }
+      }
+    }
+
+    for (Instruction *I : DeadHandleInsts) {
+      I->eraseFromParent();
+      Changed = true;
+    }
+
+    bool RemovedScaffolding = true;
+    while (RemovedScaffolding) {
+      RemovedScaffolding = false;
+      SmallVector<Instruction *, 16> DeadScaffolding;
+      for (Function &F : M) {
+        if (F.isDeclaration())
+          continue;
+
+        for (BasicBlock &BB : F) {
+          for (Instruction &I : BB) {
+            if (!I.use_empty())
+              continue;
+
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+              if (typeContainsSPVVulkanBuffer(GEP->getSourceElementType()))
+                DeadScaffolding.push_back(GEP);
+              continue;
+            }
+
+            auto *AI = dyn_cast<AllocaInst>(&I);
+            if (AI && typeContainsSPVVulkanBuffer(AI->getAllocatedType()))
+              DeadScaffolding.push_back(AI);
+          }
+        }
+      }
+
+      for (Instruction *I : DeadScaffolding) {
+        I->eraseFromParent();
+        Changed = true;
+        RemovedScaffolding = true;
+      }
+    }
   }
 
   for (CallInst *CI : HandleCalls) {
@@ -726,6 +919,17 @@ bool GPUSPIRVLowering::lowerResourceAccess(Module &M) {
   }
   for (Function *F : DeadFuncs)
     F->eraseFromParent();
+
+  SmallVector<GlobalVariable *, 8> DeadGlobals;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.use_empty() && GV.hasLocalLinkage() &&
+        typeContainsSPVVulkanBuffer(GV.getValueType()))
+      DeadGlobals.push_back(&GV);
+  }
+  for (GlobalVariable *GV : DeadGlobals) {
+    GV->eraseFromParent();
+    Changed = true;
+  }
 
   return Changed;
 }
@@ -1028,11 +1232,80 @@ bool GPUSPIRVLowering::markHelpersAlwaysInline(Module &M) {
   return Changed;
 }
 
+bool GPUSPIRVLowering::inlineAlwaysInlineHelpers(Module &M) {
+  bool Changed = false;
+  bool LocalChanged = true;
+
+  while (LocalChanged) {
+    LocalChanged = false;
+    SmallVector<CallBase *, 16> Calls;
+
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB)
+            continue;
+
+          Function *Callee = CB->getCalledFunction();
+          if (!Callee || Callee->isDeclaration() || Callee == &F)
+            continue;
+          if (!Callee->hasFnAttribute(Attribute::AlwaysInline))
+            continue;
+
+          Calls.push_back(CB);
+        }
+      }
+    }
+
+    for (CallBase *CB : Calls) {
+      if (!CB->getParent())
+        continue;
+      Function *Callee = CB->getCalledFunction();
+      if (!Callee || Callee->isDeclaration() ||
+          !Callee->hasFnAttribute(Attribute::AlwaysInline))
+        continue;
+
+      InlineFunctionInfo IFI;
+      InlineResult Res = InlineFunction(*CB, IFI);
+      if (!Res.isSuccess())
+        continue;
+
+      Changed = true;
+      LocalChanged = true;
+    }
+  }
+
+  SmallVector<Function *, 16> DeadHelpers;
+  for (Function &F : M) {
+    if (!F.isDeclaration() && F.hasLocalLinkage() && F.use_empty() &&
+        F.hasFnAttribute(Attribute::AlwaysInline) &&
+        F.getCallingConv() != CallingConv::SPIR_KERNEL)
+      DeadHelpers.push_back(&F);
+  }
+
+  for (Function *F : DeadHelpers) {
+    F->eraseFromParent();
+    Changed = true;
+  }
+
+  return Changed;
+}
+
 bool GPUSPIRVLowering::runOnModule(Module &M) {
   bool Changed = false;
   Changed |= lowerBuiltinCalls(M);
   Changed |= lowerSyncBuiltins(M);
   Changed |= lowerAtomicBuiltins(M);
+  // HLSL resource wrappers can keep SPIR-V handles hidden behind helper
+  // `this` pointers in unoptimized IR. Inline those wrappers before lowering
+  // resources so bindings are visible at the call sites.
+  Changed |= markHelpersAlwaysInline(M);
+  Changed |= inlineAlwaysInlineHelpers(M);
+  Changed |= promoteWrapperAllocas(M);
   Changed |= lowerResourceAccess(M);
   Changed |= lowerMathBuiltins(M);
   // `markHelpersAlwaysInline` must run BEFORE `stripCallingConventions`
@@ -1040,7 +1313,6 @@ bool GPUSPIRVLowering::runOnModule(Module &M) {
   // convention. If we strip that first, every function looks like a
   // helper and the subsequent GlobalDCE in the target pass pipeline
   // deletes the kernels too.
-  Changed |= markHelpersAlwaysInline(M);
   Changed |= stripCallingConventions(M);
   Changed |= stripSPIRVMetadata(M);
   Changed |= removeDuplicateKernels(M);
