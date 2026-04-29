@@ -148,6 +148,36 @@ Current math gaps:
 - this is the HLSL compute path only; OpenCL/SPIR-V math builtins are handled
   separately in `GPUSPIRVLowering.cpp`
 
+## RTL-Supported / Compiler-Missing Feature Inventory
+
+This section tracks hardware or host-runtime capabilities that exist below the
+compiler but are not yet exposed as a general compiler feature. It is meant to
+help choose future compiler work, not to imply that every RTL feature should be
+lowered directly from LLVM.
+
+| Area | RTL / host capability | Current compiler status | Compiler-side work if prioritized |
+|------|-----------------------|-------------------------|-----------------------------------|
+| ROP pixel output | RTL has `I_PIXEL_OUT` and `gpu_rop.sv` drains per-engine FIFOs, depth-tests, and writes color/depth to DDR. The 3D raster host path emits raster kernels that use this path. | `PIXEL_OUT` is defined in `GPUInstrInfo.td`, but there is no LLVM intrinsic, builtin, HLSL lowering, or normal IR pattern that emits it. | Add a target intrinsic such as `llvm.gpu.pixel.out(color, depth, offset)` plus ISel/lit tests, then optionally expose it through an HLSL/OpenCL builtin for software raster kernels. |
+| Triangle setup / raster pipeline | The superproject has a working software graphics pipeline: vertex transform, triangle setup, raster walk, and `PIXEL_OUT` into the ROP. | The compiler does not own a graphics pipeline. HLSL support is compute-only; there is no vertex/pixel shader stage lowering, no draw-call ABI, and no automatic triangle setup/raster generation. | Treat this as staged work: first expose `PIXEL_OUT` for compute-style raster kernels, then decide whether full graphics shader stages are worth modeling. |
+| Buffer/resource binding model | Descriptors can initialize `r1-r4`; reflected launches can use an indirect argument buffer through `r1`; host code already builds descriptors from `.gpu.meta`. | HLSL/DX resources currently map binding slot `0..3` to `r1..r4`, and `>4` to the indirect args buffer. `RawBuffer`, simple `TypedBuffer`, and scalar `cbuffer` loads are covered, but binding space/range, descriptor arrays, and dynamic resource indexing are not real features. | Define the intended descriptor model first: whether binding `space`, ranges, arrays, and dynamic indexing become metadata, an explicit descriptor table in memory, or remain unsupported. Then teach `GPUHLSLLowering` / `GPUSPIRVLowering` to preserve and lower that model. |
+| Constant buffers / cbuffers | Host paths can upload parameter blocks and pass the base address through a descriptor register. PathTracer now uses a real HLSL `cbuffer` for scalar params. | Simple scalar cbuffer member loads and `dx.resource.load.cbufferrow` lower to memory loads from the bound base. Full HLSL cbuffer layout support is not modeled: vectors/matrices, nested aggregates, arrays, packing edge cases, and richer reflection are still limited. | Extend cbuffer layout handling and add source-level tests for vectors, matrices, arrays, and nonzero offsets before claiming broader cbuffer support. |
+| Global/UAV atomics | RTL global `I_ATOMIC` has opcodes for integer add/and/or/xor/min/max/swap/CAS and also float add/min/max. | Compiler supports integer `atomicrmw`/`cmpxchg` shapes used by OpenCL and HLSL `Interlocked*`. Float atomics and some exact source-level variants are not covered. | Add IR/SelectionDAG coverage for float atomics only if a source language path needs them; otherwise keep them documented as RTL capacity. |
+| Command processor operations | RTL/host command path supports DMA, memset, fences, semaphores, engine fences, barriers, dispatch, and workgroup dispatch. | LLVM emits kernel objects and metadata, not command buffers. Runtime/host code owns command submission. | Do not move these into the compiler unless a real command-buffer compiler is introduced. Keep launch metadata in `.gpu.meta` and command construction in the host runtime. |
+| Native framebuffer / HDMI scanout | RTL can scan out a native 1920x1080 ARGB8888 framebuffer from DDR; host tests write patterns to that framebuffer. | Compiler only sees ordinary DDR stores. It does not model scanout surfaces, swaps, or display timing. | Not a backend lowering target unless we introduce a graphics/display ABI. For now, kernels should write the agreed DDR framebuffer address through normal memory operations or `PIXEL_OUT`. |
+| Texture-like workloads | Doom and software renderers use manually uploaded texture data and ordinary loads. | There is no hardware sampler and no HLSL `Texture2D.Sample` / sampler lowering. | If needed short term, lower restricted texture access as explicit buffer loads in software. Do not present this as native texture/sampler support. |
+
+Near-term compiler priorities from this list:
+
+1. Expose `PIXEL_OUT` through a narrow target intrinsic or builtin, because the
+   RTL instruction already exists and this would let compiler-generated compute
+   raster kernels use the ROP path.
+2. Tighten and document the resource binding model before adding descriptor
+   arrays or dynamic indexing, because the ABI decision affects host metadata,
+   HLSL lowering, and SPIR-V resource lowering together.
+3. Extend cbuffer layout support only with lit tests that match the actual
+   Clang-emitted IR shapes, so we do not recreate the old script-only cbuffer
+   rewriting path inside the compiler.
+
 ## External Tools
 
 | Tool | Location | Use |
