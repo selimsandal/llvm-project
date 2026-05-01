@@ -16,6 +16,14 @@ def int_gpu_mem_fence : DefaultAttrsIntrinsic<[], [llvm_i32_ty],
                             [IntrWriteMem, IntrInaccessibleMemOnly,
                              IntrConvergent]>;
 
+// Push one active-lane pixel packet into the render output unit:
+//   offset = byte offset within framebuffer/depth buffers
+//   depth  = new depth value bits
+//   color  = new color value bits
+def int_gpu_pixel_out : DefaultAttrsIntrinsic<[],
+                            [llvm_i32_ty, llvm_i32_ty, llvm_i32_ty],
+                            [IntrWriteMem, IntrConvergent]>;
+
 // Integer reductions (i32 -> i32)
 def int_gpu_reduce_add  : DefaultAttrsIntrinsic<[llvm_i32_ty], [llvm_i32_ty],
                             [IntrNoMem, IntrConvergent]>;

@@ -378,6 +378,14 @@ void GPUDAGToDAGISel::Select(SDNode *N) {
       CurDAG->SelectNodeTo(N, GPU::MEM_FENCE, MVT::Other, Ops);
       return;
     }
+    case Intrinsic::gpu_pixel_out: {
+      SDValue Offset = N->getOperand(2);
+      SDValue Depth = N->getOperand(3);
+      SDValue Color = N->getOperand(4);
+      SDValue Ops[] = {Offset, Depth, Color, N->getOperand(0)};
+      CurDAG->SelectNodeTo(N, GPU::PIXEL_OUT, MVT::Other, Ops);
+      return;
+    }
     }
     break;
   }
