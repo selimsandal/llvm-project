@@ -85,12 +85,31 @@ Working:
   - current compute-only subset
   - `@llvm.dx.*` system values lower through hidden workgroup context /
     `I_GETSR` and compiler-derived IDs
-  - resource bindings still map to `r1-r4` (`<=4` direct, `>4` indirect)
+  - resource bindings use the current static binding contract documented below
   - `groupshared` globals, `GroupMemoryBarrierWithGroupSync()`, and the
     verified `groupshared` `Interlocked*` subset compile on this path
   - `void GPUEmitPixel(uint offset, uint depth, uint color);` lowers to
     `PIXEL_OUT` for software raster / ROP-style compute kernels; declare it
     as a prototype and do not define a body
+
+## HLSL Resource Binding Contract
+
+Current HLSL resource lowering is intentionally simple and slot-based:
+
+- binding slots `0..3` map directly to descriptor registers:
+  `u0/t0/b0 -> r1`, `u1/t1/b1 -> r2`, `u2/t2/b2 -> r3`,
+  `u3/t3/b3 -> r4`
+- if any resource in the module uses binding slot `4` or above, the module
+  uses the indirect path: `r1` holds an argument-buffer pointer, and binding
+  slot `N` is loaded from `[r1 + N*4]`
+- `register(spaceN)` is currently not modeled; lowering ignores the space and
+  uses only the binding slot
+- descriptor ranges, descriptor arrays, and dynamic resource indexing are not
+  real features yet
+
+This is covered by `hlsl-resource-binding-direct.ll` and
+`hlsl-resource-binding-indirect.ll`. Do not claim a richer HLSL descriptor
+model until these ABI decisions are made explicitly.
 
 ## HLSL Math Lowering Status
 
@@ -164,7 +183,7 @@ lowered directly from LLVM.
 | Area | RTL / host capability | Current compiler status | Compiler-side work if prioritized |
 |------|-----------------------|-------------------------|-----------------------------------|
 | ROP pixel output | RTL has `I_PIXEL_OUT` and `gpu_rop.sv` drains per-engine FIFOs, depth-tests, and writes color/depth to DDR. The 3D raster host path emits raster kernels that use this path. | `PIXEL_OUT` is defined in `GPUInstrInfo.td`; LLVM IR can emit it through `llvm.gpu.pixel.out(offset, depth, color)`, and HLSL compute source can declare `void GPUEmitPixel(uint offset, uint depth, uint color);` to reach the same path. This must be a prototype declaration: if source defines a helper body, Clang may inline that body before backend lowering and no `PIXEL_OUT` is emitted. There is no OpenCL builtin yet. | Keep this scoped to compute-style software raster kernels unless a real graphics shader-stage ABI is introduced. Add OpenCL/source-header exposure only if a source path needs it. |
-| Triangle setup / raster pipeline | The superproject has a working software graphics pipeline: vertex transform, triangle setup, raster walk, and `PIXEL_OUT` into the ROP. | The compiler does not own a graphics pipeline. HLSL support is compute-only; there is no vertex/pixel shader stage lowering, no draw-call ABI, and no automatic triangle setup/raster generation. | Treat this as staged work: first expose `PIXEL_OUT` for compute-style raster kernels, then decide whether full graphics shader stages are worth modeling. |
+| Triangle setup / raster pipeline | The superproject has a working software graphics pipeline: vertex transform, triangle setup, raster walk, and `PIXEL_OUT` into the ROP. | The compiler does not own a graphics pipeline. HLSL support is compute-only; there is no vertex/pixel shader stage lowering, no draw-call ABI, and no automatic triangle setup/raster generation. Compute-style `PIXEL_OUT` exposure is now covered by the ROP row above. | Decide whether full graphics shader stages are worth modeling. If not, keep triangle setup/rasterization in host or compute kernels that explicitly call the pixel-output hook. |
 | Buffer/resource binding model | Descriptors can initialize `r1-r4`; reflected launches can use an indirect argument buffer through `r1`; host code already builds descriptors from `.gpu.meta`. | HLSL/DX resources currently map binding slot `0..3` to `r1..r4`, and `>4` to the indirect args buffer. `RawBuffer`, simple `TypedBuffer`, and scalar `cbuffer` loads are covered, but binding space/range, descriptor arrays, and dynamic resource indexing are not real features. | Define the intended descriptor model first: whether binding `space`, ranges, arrays, and dynamic indexing become metadata, an explicit descriptor table in memory, or remain unsupported. Then teach `GPUHLSLLowering` / `GPUSPIRVLowering` to preserve and lower that model. |
 | Constant buffers / cbuffers | Host paths can upload parameter blocks and pass the base address through a descriptor register. PathTracer now uses a real HLSL `cbuffer` for scalar params. | Simple scalar cbuffer member loads and `dx.resource.load.cbufferrow` lower to memory loads from the bound base. Full HLSL cbuffer layout support is not modeled: vectors/matrices, nested aggregates, arrays, packing edge cases, and richer reflection are still limited. | Extend cbuffer layout handling and add source-level tests for vectors, matrices, arrays, and nonzero offsets before claiming broader cbuffer support. |
 | Global/UAV atomics | RTL global `I_ATOMIC` has opcodes for integer add/and/or/xor/min/max/swap/CAS and also float add/min/max. | Compiler supports integer `atomicrmw`/`cmpxchg` shapes used by OpenCL and HLSL `Interlocked*`. Float atomics and some exact source-level variants are not covered. | Add IR/SelectionDAG coverage for float atomics only if a source language path needs them; otherwise keep them documented as RTL capacity. |
@@ -174,9 +193,9 @@ lowered directly from LLVM.
 
 Near-term compiler priorities from this list:
 
-1. Tighten and document the resource binding model before adding descriptor
-   arrays or dynamic indexing, because the ABI decision affects host metadata,
-   HLSL lowering, and SPIR-V resource lowering together.
+1. Decide the future resource descriptor ABI before adding binding spaces,
+   descriptor arrays, or dynamic indexing, because that decision affects host
+   metadata, HLSL lowering, and SPIR-V resource lowering together.
 2. Extend cbuffer layout support only with lit tests that match the actual
    Clang-emitted IR shapes, so we do not recreate the old script-only cbuffer
    rewriting path inside the compiler.
@@ -203,7 +222,7 @@ Near-term compiler priorities from this list:
 | `GPUMCCodeEmitter.cpp` | 128-bit binary encoding |
 | `GPUMCInstLower.cpp` | MI -> MCInst with source modifier flags |
 | `GPUSPIRVLowering.cpp` | OpenCL/SPIR-V builtin lowering onto raw workgroup state + compiler-derived IDs; also marks helper functions `alwaysinline + internal` so vector / aggregate-typed helpers disappear before ISel |
-| `GPUHLSLLowering.cpp` | HLSL lowering: system values, resources, wave ops, barriers, and `groupshared` intrinsics |
+| `GPUHLSLLowering.cpp` | HLSL lowering: system values, resources, wave ops, barriers, `groupshared` intrinsics, and the `GPUEmitPixel` hook |
 | `GPUSubwordMemoryLowering.cpp` | IR-level rewriter that turns ordinary `addrspace(1)` `i1`/`i8`/`i16` loads/stores into aligned i32 word load + shift/mask (loads) or read-modify-write (stores). Atomic/volatile sub-word global stores are rejected explicitly instead of being mislowered through that RMW path. |
 | `GPUKernelMetadata.cpp` | `.gpu.meta` section emission |
 
