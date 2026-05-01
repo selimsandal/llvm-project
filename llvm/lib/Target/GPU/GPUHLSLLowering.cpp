@@ -26,6 +26,7 @@
 //   *MemoryBarrier()      → llvm.gpu.mem.fence(mode)
 //   *MemoryBarrierWithGroupSync()
 //                         → llvm.gpu.workgroup.sync(mode)
+//   GPUEmitPixel(o,d,c)   → llvm.gpu.pixel.out(o,d,c) → PIXEL_OUT
 // Barrier modes match the OpenCL/SPIR-V lowering convention:
 //   group/local = 1, device/global = 2, all = 3.
 //
@@ -82,6 +83,7 @@ public:
 private:
   bool lowerThreadIDIntrinsics(Module &M);
   bool lowerSyncIntrinsics(Module &M);
+  bool lowerPixelOutputCalls(Module &M);
   bool lowerInterlockedAtomicCalls(Module &M);
   bool lowerResourceAccess(Module &M);
   bool lowerWaveIntrinsics(Module &M);
@@ -525,6 +527,73 @@ bool GPUHLSLLowering::lowerSyncIntrinsics(Module &M) {
       SmallVector<OperandBundleDef, 1> Bundles;
       CI->getOperandBundlesAsDefs(Bundles);
       Builder.CreateCall(Sync, {Builder.getInt32(BarrierMode(Kind))}, Bundles);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    ToReplace.clear();
+
+    if (F.use_empty())
+      ToDelete.push_back(&F);
+  }
+
+  for (Function *F : ToDelete)
+    F->eraseFromParent();
+
+  return Changed;
+}
+
+static bool isGPUEmitPixelCandidateName(StringRef Name) {
+  return Name == "GPUEmitPixel" || Name.starts_with("_Z12GPUEmitPixel");
+}
+
+static bool hasValidGPUEmitPixelSignature(Function *F, CallInst *CI) {
+  if (!F->isDeclaration())
+    return false;
+  StringRef Name = F->getName();
+  if (Name != "GPUEmitPixel" && Name != "_Z12GPUEmitPixeljjj")
+    return false;
+  if (!CI->getType()->isVoidTy() || CI->arg_size() != 3)
+    return false;
+  return CI->getArgOperand(0)->getType()->isIntegerTy(32) &&
+         CI->getArgOperand(1)->getType()->isIntegerTy(32) &&
+         CI->getArgOperand(2)->getType()->isIntegerTy(32);
+}
+
+bool GPUHLSLLowering::lowerPixelOutputCalls(Module &M) {
+  bool Changed = false;
+  SmallVector<CallInst *, 8> ToReplace;
+  SmallVector<Function *, 4> ToDelete;
+
+  for (Function &F : M) {
+    if (!isGPUEmitPixelCandidateName(F.getName()))
+      continue;
+
+    for (User *U : F.users()) {
+      if (auto *CI = dyn_cast<CallInst>(U))
+        ToReplace.push_back(CI);
+    }
+
+    for (CallInst *CI : ToReplace) {
+      if (!hasValidGPUEmitPixelSignature(&F, CI)) {
+        M.getContext().emitError(
+            CI, "GPUEmitPixel must be declared as "
+                "void GPUEmitPixel(uint offset, uint depth, uint color)");
+        if (!CI->getType()->isVoidTy())
+          CI->replaceAllUsesWith(PoisonValue::get(CI->getType()));
+        CI->eraseFromParent();
+        Changed = true;
+        continue;
+      }
+
+      IRBuilder<> Builder(CI);
+      Function *PixelOut = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::gpu_pixel_out, {});
+      SmallVector<OperandBundleDef, 1> Bundles;
+      CI->getOperandBundlesAsDefs(Bundles);
+      Builder.CreateCall(PixelOut,
+                         {CI->getArgOperand(0), CI->getArgOperand(1),
+                          CI->getArgOperand(2)},
+                         Bundles);
       CI->eraseFromParent();
       Changed = true;
     }
@@ -1866,6 +1935,7 @@ bool GPUHLSLLowering::runOnModule(Module &M) {
   bool Changed = false;
   Changed |= lowerThreadIDIntrinsics(M);
   Changed |= lowerSyncIntrinsics(M);
+  Changed |= lowerPixelOutputCalls(M);
   Changed |= lowerInterlockedAtomicCalls(M);
   Changed |= promoteSimpleAllocas(M);
   Changed |= lowerResourceAccess(M);
